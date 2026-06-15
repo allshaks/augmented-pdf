@@ -1,4 +1,4 @@
-import { ItemView, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
+import { ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
 import { runClaude } from "../claude/runner";
 import { ChatContext, Turn } from "../types";
 import { appendChatEntry, findHub, findOrCreateHub, readPriorSummaries, updateEntrySummary } from "../store/hub";
@@ -106,8 +106,9 @@ export class ChatView extends ItemView {
     const inputRow = root.createDiv({ cls: "apc-input-row" });
     this.inputEl = inputRow.createEl("textarea", {
       cls: "apc-input",
-      attr: { rows: "2", placeholder: "Ask about the passage…  (Enter to send · Shift+Enter = newline)" },
+      attr: { rows: "1", placeholder: "Ask about the passage…  (Enter to send · Shift+Enter = newline)" },
     });
+    this.inputEl.addEventListener("input", () => this.autoGrowInput());
     this.inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
@@ -192,13 +193,27 @@ export class ChatView extends ItemView {
     }
   }
 
-  private addBubble(role: "user" | "claude", text: string): HTMLElement {
+  private addBubble(role: "user" | "claude", text: string, markdown = false): HTMLElement {
     const wrap = this.messagesEl.createDiv({ cls: `apc-msg apc-${role}` });
     wrap.createDiv({ cls: "apc-role", text: role === "user" ? "You" : "Claude" });
     const body = wrap.createDiv({ cls: "apc-body" });
-    body.setText(text);
+    if (markdown && text) void this.renderMd(body, text);
+    else body.setText(text);
     this.scrollToBottom();
     return body;
+  }
+
+  /** Render markdown (incl. math/code) into a bubble, replacing its contents. */
+  private async renderMd(el: HTMLElement, md: string): Promise<void> {
+    el.empty();
+    await MarkdownRenderer.render(this.app, md, el, "", this);
+  }
+
+  /** Grow the input textarea to fit its content, up to a cap (then it scrolls). */
+  private autoGrowInput(): void {
+    const el = this.inputEl;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 240) + "px";
   }
 
   private scrollToBottom(): void {
@@ -224,13 +239,14 @@ export class ChatView extends ItemView {
     const q = this.inputEl.value.trim();
     if (!q) return;
     this.inputEl.value = "";
+    this.autoGrowInput();
 
     if (this.summaryTimer !== null) {
       window.clearTimeout(this.summaryTimer);
       this.summaryTimer = null;
     }
 
-    this.addBubble("user", q);
+    this.addBubble("user", q, true);
     this.turns.push({ role: "user", text: q });
     const claudeBody = this.addBubble("claude", "");
     let acc = "";
@@ -268,7 +284,9 @@ export class ChatView extends ItemView {
         onDone: (r) => {
           this.turnCount++;
           if (r.costUsd) this.totalCost += r.costUsd;
-          if (r.isError && !acc) claudeBody.setText("(error — see console)");
+          // Swap the plain streamed text for rendered markdown now the turn is complete.
+          const finalText = acc || (r.isError ? "(error — see console)" : "");
+          void this.renderMd(claudeBody, finalText).then(() => this.scrollToBottom());
           const meta = claudeBody.parentElement?.createDiv({ cls: "apc-meta" });
           meta?.setText(`${this.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${this.totalCost.toFixed(4)}`);
           this.turns.push({ role: "claude", text: acc, costUsd: r.costUsd });

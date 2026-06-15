@@ -107,6 +107,25 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   margin-top: var(--size-2-1);
 }
 
+/* Tighten rendered-markdown spacing inside chat bubbles */
+.apc-body > :first-child {
+  margin-top: 0;
+}
+.apc-body > :last-child {
+  margin-bottom: 0;
+}
+.apc-body p,
+.apc-body ul,
+.apc-body ol,
+.apc-body pre,
+.apc-body blockquote {
+  margin: 0.4em 0;
+}
+.apc-body pre {
+  white-space: pre;
+  overflow-x: auto;
+}
+
 .apc-input-row {
   flex: 0 0 auto;
   display: flex;
@@ -115,9 +134,12 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 }
 .apc-input {
   width: 100%;
-  resize: vertical;
-  min-height: 2.5em;
+  resize: none; /* height is managed by autoGrowInput() */
+  min-height: 2.4em;
+  max-height: 240px;
+  overflow-y: auto;
   font-size: var(--font-ui-small);
+  line-height: var(--line-height-tight);
 }
 .apc-buttons {
   display: flex;
