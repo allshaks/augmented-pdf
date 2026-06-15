@@ -124,19 +124,20 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 }
 .apc-body ul,
 .apc-body ol {
-  margin: 0.35em 0;
+  margin: 0.25em 0;
   padding-left: 1.3em;
 }
 .apc-body li {
-  margin: 0.05em 0;
+  margin: 0.08em 0; /* just a hair more than the line gap */
 }
-/* loose lists wrap each item's text in <p> — kill that extra gap */
-.apc-body li > p {
-  margin: 0.05em 0;
+/* loose lists wrap each item's text in <p> (sometimes not a direct child) —
+   use a descendant selector and zero it so items don't get paragraph spacing */
+.apc-body li p {
+  margin: 0;
 }
 .apc-body li > ul,
 .apc-body li > ol {
-  margin: 0.1em 0;
+  margin: 0.08em 0;
 }
 .apc-body blockquote {
   margin: 0.4em 0;
