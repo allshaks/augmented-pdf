@@ -147,6 +147,31 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   overflow-x: auto;
 }
 
+/* Allow selecting/copying chat text (the leaf chrome defaults to user-select:none) */
+.augmented-pdf-chat .apc-messages,
+.augmented-pdf-chat .apc-quote {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+
+/* Tables: our bubbles aren't .markdown-rendered, so add borders explicitly */
+.apc-body table {
+  border-collapse: collapse;
+  margin: 0.4em 0;
+  font-size: var(--font-ui-smaller);
+}
+.apc-body th,
+.apc-body td {
+  border: 1px solid var(--background-modifier-border);
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+.apc-body th {
+  background: var(--background-secondary);
+  font-weight: var(--font-semibold);
+}
+
 .apc-input-row {
   flex: 0 0 auto;
   display: flex;
