@@ -104,7 +104,7 @@ PDF++ + Obsidian versions, degrade gracefully when a hook is missing.
 - **PATH gotcha (top runtime risk):** GUI apps don't inherit the shell PATH, so
   `spawn('claude')` often fails with `ENOENT`. → Settings field for an **absolute binary path**
   + best-effort autodetect (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, npm global).
-  This machine: `/Users/sashko/.local/bin/claude` (v2.1.119).
+  e.g. `~/.local/bin/claude` (verified against CLI v2.1.119).
 - **Side panel** = an `ItemView` registered with `registerView`; open via
   `workspace.getRightLeaf(false)`. Never cache view instances — re-acquire with
   `getLeavesOfType()`.
