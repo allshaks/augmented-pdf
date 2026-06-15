@@ -50,3 +50,14 @@ export function slugify(s: string): string {
 export function oneLine(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
+
+/** Pull the passage text out of a `> [!quote] …` callout (hub or transcript body). */
+export function extractQuotePassage(content: string): string {
+  const m = content.match(/> \[!quote\][^\n]*\n((?:>.*\n?)+)/);
+  if (!m) return "";
+  return m[1]
+    .split("\n")
+    .map((l) => l.replace(/^>\s?/, ""))
+    .join("\n")
+    .trim();
+}

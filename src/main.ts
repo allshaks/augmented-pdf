@@ -16,6 +16,8 @@ import { CHAT_VIEW_TYPE, ChatView } from "./chat/view";
 import { ChatContext } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
 import { findHub, findNearbyHubs } from "./store/hub";
+import { parseTranscriptTurns } from "./store/transcript";
+import { extractQuotePassage } from "./store/paths";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
@@ -49,16 +51,18 @@ export default class AugmentedPdfPlugin extends Plugin {
 
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new ChatView(leaf, this));
 
-    // Render the "New chat about this highlight" button inside hub annotation notes.
+    // Render an action button inside hub notes ("New chat") and transcripts ("Continue chat").
     this.registerMarkdownCodeBlockProcessor("augmented-pdf-chat", (_src, el, ctx) => {
-      const btn = el.createEl("button", {
-        cls: "mod-cta apc-hub-btn",
-        text: "💬 New chat about this highlight",
-      });
-      btn.onclick = () => {
-        const f = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
-        if (f instanceof TFile) void this.openChatFromHub(f);
-      };
+      const f = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+      if (!(f instanceof TFile)) return;
+      const type = this.app.metadataCache.getFileCache(f)?.frontmatter?.["augmented-pdf"];
+      if (type === "transcript") {
+        const btn = el.createEl("button", { cls: "mod-cta apc-hub-btn", text: "↻ Continue this chat in the sidebar" });
+        btn.onclick = () => void this.openChatFromTranscript(f);
+      } else {
+        const btn = el.createEl("button", { cls: "mod-cta apc-hub-btn", text: "💬 New chat about this highlight" });
+        btn.onclick = () => void this.openChatFromHub(f);
+      }
     });
 
     // Keep annotation/chat folders in sync when a PDF is renamed or moved.
@@ -85,6 +89,22 @@ export default class AugmentedPdfPlugin extends Plugin {
           !!f && f.extension === "md" && this.isHubNote(f);
         if (isHub) {
           if (!checking) void this.openChatFromHub(f!);
+          return true;
+        }
+        return false;
+      },
+    });
+    this.addCommand({
+      id: "continue-chat-from-transcript",
+      name: "Continue this chat in the sidebar (run from a transcript)",
+      checkCallback: (checking: boolean) => {
+        const f = this.app.workspace.getActiveFile();
+        const isTranscript =
+          !!f &&
+          f.extension === "md" &&
+          this.app.metadataCache.getFileCache(f)?.frontmatter?.["augmented-pdf"] === "transcript";
+        if (isTranscript) {
+          if (!checking) void this.openChatFromTranscript(f!);
           return true;
         }
         return false;
@@ -289,7 +309,7 @@ export default class AugmentedPdfPlugin extends Plugin {
     const selId = String(fm.selection ?? "");
     const color = String(fm.color ?? this.settings.defaultColor);
     let passage = typeof fm.passage === "string" ? fm.passage : "";
-    if (!passage) passage = await this.extractPassageFromHub(hubFile);
+    if (!passage) passage = extractQuotePassage(await this.app.vault.cachedRead(hubFile));
     if (!pdfName || !selId || !page) {
       new Notice("Annotation note is missing pdf/page/selection metadata.");
       return;
@@ -313,16 +333,52 @@ export default class AugmentedPdfPlugin extends Plugin {
     view.setContext(ctx);
   }
 
-  /** Fallback for older hubs without a `passage:` field — read it from the quote callout. */
-  private async extractPassageFromHub(file: TFile): Promise<string> {
-    const c = await this.app.vault.cachedRead(file);
-    const m = c.match(/> \[!quote\][^\n]*\n((?:>.*\n?)+)/);
-    if (!m) return "";
-    return m[1]
-      .split("\n")
-      .map((l) => l.replace(/^>\s?/, ""))
-      .join("\n")
-      .trim();
+  /** Load an existing chat from its transcript note into the sidebar (resumes its session). */
+  async openChatFromTranscript(file: TFile): Promise<void> {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (!fm || fm["augmented-pdf"] !== "transcript") {
+      new Notice("This isn't an Augmented PDF chat transcript.");
+      return;
+    }
+    const link = (v: unknown) => String(v ?? "").replace(/^\[\[|\]\]$/g, "").trim();
+    const content = await this.app.vault.cachedRead(file);
+    const pdfName = link(fm.pdf);
+    const page = Number(fm.page);
+    const selId = String(fm.selection ?? "");
+    const sessionId = String(fm["session-id"] ?? "");
+    if (!pdfName || !selId || !page || !sessionId) {
+      new Notice("Transcript is missing pdf/page/selection/session metadata.");
+      return;
+    }
+    const pdf = this.app.metadataCache.getFirstLinkpathDest(pdfName, file.path);
+    const pdfPath = pdf?.path ?? pdfName;
+    const hubName = link(fm.hub);
+    const hub = hubName ? this.app.metadataCache.getFirstLinkpathDest(hubName, file.path) : null;
+    const ctx: ChatContext = {
+      pdfName,
+      pdfPath,
+      page,
+      selId,
+      color: String(fm.color ?? this.settings.defaultColor),
+      passage: extractQuotePassage(content),
+      litNote: this.findLitNote(pdfPath, pdfName) ?? (fm["lit-note"] ? link(fm["lit-note"]) : undefined),
+    };
+    const view = await this.activateChatView();
+    if (!view) {
+      new Notice("Couldn't open the chat panel.");
+      return;
+    }
+    view.loadThread({
+      ctx,
+      sessionId,
+      turns: parseTranscriptTurns(content),
+      totalCost: Number(fm.cost_usd ?? 0),
+      model: typeof fm.model === "string" ? fm.model : this.settings.model,
+      hubFile: hub instanceof TFile ? hub : null,
+      transcriptFile: file,
+      createdISO: String(fm.created ?? "") || new Date().toISOString(),
+      summary: fm.summary ? String(fm.summary) : null,
+    });
   }
 
   /** S3 diagnostic: write a note with a PDF++ selection link to confirm a highlight renders. */

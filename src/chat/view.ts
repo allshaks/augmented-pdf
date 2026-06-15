@@ -159,6 +159,51 @@ export class ChatView extends ItemView {
     void this.loadPriorContext(ctx);
   }
 
+  /** Load an existing chat (from its transcript) into the sidebar to read/continue it. */
+  loadThread(o: {
+    ctx: ChatContext;
+    sessionId: string;
+    turns: Turn[];
+    totalCost: number;
+    model: string;
+    hubFile: TFile | null;
+    transcriptFile: TFile;
+    createdISO: string;
+    summary: string | null;
+  }): void {
+    this.concludeThread(); // summarize the outgoing thread first
+    this.stop();
+    if (this.summaryTimer !== null) {
+      window.clearTimeout(this.summaryTimer);
+      this.summaryTimer = null;
+    }
+    this.ctx = o.ctx;
+    this.sessionId = o.sessionId;
+    this.turns = o.turns.slice();
+    // >0 so the next message --resumes the original session rather than forcing a new id
+    this.turnCount = this.turns.filter((t) => t.role === "claude").length;
+    this.totalCost = o.totalCost;
+    this.model = o.model;
+    this.hubFile = o.hubFile;
+    this.transcriptFile = o.transcriptFile;
+    this.createdISO = o.createdISO;
+    this.threadSummary = o.summary;
+    this.entryAppended = true; // the hub entry already exists
+    this.summarizedTurnCount = this.turns.length;
+    this.priorContext = "";
+
+    if (this.modelSelect && Array.from(this.modelSelect.options).some((opt) => opt.value === o.model)) {
+      this.modelSelect.value = o.model;
+    }
+    this.messagesEl.empty();
+    this.statusEl.setText(`Loaded chat · ${o.transcriptFile.basename}`);
+    this.renderHeader();
+    for (const t of this.turns) this.addBubble(t.role, t.text, true);
+    this.scrollToBottom();
+    window.setTimeout(() => this.inputEl?.focus(), 0);
+    void this.loadPriorContext(o.ctx);
+  }
+
   private resetThread(): void {
     this.stop();
     if (this.summaryTimer !== null) {

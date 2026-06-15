@@ -60,6 +60,10 @@ function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
     fm,
     `[[${o.hubBasename}|← Back to annotation]]`,
     "",
+    "```augmented-pdf-chat",
+    "continue",
+    "```",
+    "",
     `> [!quote] Highlighted passage (p.${ctx.page})`,
     "> " + ctx.passage.replace(/\n/g, "\n> "),
     "",
@@ -77,4 +81,18 @@ function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
 
 function firstUserText(turns: Turn[]): string {
   return turns.find((t) => t.role === "user")?.text ?? "chat";
+}
+
+/** Parse the You/Claude turns back out of a transcript's markdown (for reloading a chat). */
+export function parseTranscriptTurns(content: string): Turn[] {
+  const turns: Turn[] = [];
+  const heads = [...content.matchAll(/^##\s+(You|Claude)\s*$/gm)];
+  for (let i = 0; i < heads.length; i++) {
+    const role = heads[i][1] === "You" ? "user" : "claude";
+    const start = (heads[i].index ?? 0) + heads[i][0].length;
+    const end = i + 1 < heads.length ? heads[i + 1].index ?? content.length : content.length;
+    const text = content.slice(start, end).trim();
+    if (text) turns.push({ role, text });
+  }
+  return turns;
 }
