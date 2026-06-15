@@ -43,6 +43,8 @@ export class ChatView extends ItemView {
   private summarizedTurnCount = 0;
   private summaryTimer: number | null = null;
   private priorContext = "";
+  private activeTicker: number | null = null;
+  private activeIndicator: HTMLElement | null = null;
 
   // DOM
   private headerEl!: HTMLElement;
@@ -249,6 +251,40 @@ export class ChatView extends ItemView {
     this.addBubble("user", q, true);
     this.turns.push({ role: "user", text: q });
     const claudeBody = this.addBubble("claude", "");
+
+    // "Thinking… Ns" (live) → "Thought for Ns" once the first token arrives.
+    const wrap = claudeBody.parentElement as HTMLElement;
+    const indicator = wrap.createDiv({ cls: "apc-thinking" });
+    wrap.insertBefore(indicator, claudeBody);
+    indicator.hide();
+    this.activeIndicator = indicator;
+    const t0 = Date.now();
+    let firstText = false;
+    this.clearThinkingTicker();
+    this.activeTicker = window.setInterval(() => {
+      if (firstText) return;
+      const ms = Date.now() - t0;
+      if (ms >= 600) {
+        indicator.setText(`Thinking… ${Math.round(ms / 1000)}s`);
+        indicator.show();
+      }
+    }, 250);
+    const finalizeThinking = () => {
+      if (firstText) return;
+      firstText = true;
+      this.clearThinkingTicker();
+      const ms = Date.now() - t0;
+      if (ms >= 1000) {
+        indicator.setText(`Thought for ${(ms / 1000).toFixed(1)}s`);
+        indicator.removeClass("apc-thinking");
+        indicator.addClass("apc-thought");
+        indicator.show();
+      } else {
+        indicator.remove();
+      }
+      this.activeIndicator = null; // finalized — no longer interruptible
+    };
+
     let acc = "";
     this.setStreaming(true);
 
@@ -277,11 +313,17 @@ export class ChatView extends ItemView {
       },
       {
         onText: (t) => {
+          finalizeThinking();
           acc += t;
           claudeBody.setText(acc);
           this.scrollToBottom();
         },
         onDone: (r) => {
+          if (!firstText) {
+            this.clearThinkingTicker();
+            indicator.remove();
+            this.activeIndicator = null;
+          }
           this.turnCount++;
           if (r.costUsd) this.totalCost += r.costUsd;
           // Swap the plain streamed text for rendered markdown now the turn is complete.
@@ -297,6 +339,11 @@ export class ChatView extends ItemView {
           this.scheduleSummary();
         },
         onError: (e) => {
+          if (!firstText) {
+            this.clearThinkingTicker();
+            indicator.remove();
+            this.activeIndicator = null;
+          }
           console.error("[augmented-pdf] chat error", e);
           claudeBody.setText((acc ? acc + "\n\n" : "") + "⚠️ " + e.message);
           this.child = null;
@@ -315,7 +362,19 @@ export class ChatView extends ItemView {
       }
       this.child = null;
     }
+    this.clearThinkingTicker();
+    if (this.activeIndicator) {
+      this.activeIndicator.remove();
+      this.activeIndicator = null;
+    }
     if (this.sendBtn) this.setStreaming(false);
+  }
+
+  private clearThinkingTicker(): void {
+    if (this.activeTicker != null) {
+      window.clearInterval(this.activeTicker);
+      this.activeTicker = null;
+    }
   }
 
   /** Create/update the transcript and ensure a hub entry exists for this thread. */

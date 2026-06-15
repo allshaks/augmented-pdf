@@ -107,6 +107,30 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   margin-top: var(--size-2-1);
 }
 
+/* "Thinking… Ns" (live, pulsing) / "Thought for Ns" (settled) */
+.apc-thinking,
+.apc-thought {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  font-style: italic;
+  margin: 0.1em 0 0.25em;
+}
+.apc-thinking {
+  animation: apc-pulse 1.2s ease-in-out infinite;
+}
+.apc-thought {
+  opacity: 0.7;
+}
+@keyframes apc-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 /* Tighten rendered-markdown spacing inside chat bubbles */
 .apc-body {
   /* Obsidian uses these vars for paragraph/list spacing in rendered markdown */
