@@ -108,20 +108,41 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 }
 
 /* Tighten rendered-markdown spacing inside chat bubbles */
+.apc-body {
+  /* Obsidian uses these vars for paragraph/list spacing in rendered markdown */
+  --p-spacing: 0.35em;
+  --list-spacing: 0.1em;
+}
 .apc-body > :first-child {
   margin-top: 0;
 }
 .apc-body > :last-child {
   margin-bottom: 0;
 }
-.apc-body p,
+.apc-body p {
+  margin: 0.35em 0;
+}
 .apc-body ul,
-.apc-body ol,
-.apc-body pre,
+.apc-body ol {
+  margin: 0.35em 0;
+  padding-left: 1.3em;
+}
+.apc-body li {
+  margin: 0.05em 0;
+}
+/* loose lists wrap each item's text in <p> — kill that extra gap */
+.apc-body li > p {
+  margin: 0.1em 0;
+}
+.apc-body li > ul,
+.apc-body li > ol {
+  margin: 0.1em 0;
+}
 .apc-body blockquote {
   margin: 0.4em 0;
 }
 .apc-body pre {
+  margin: 0.4em 0;
   white-space: pre;
   overflow-x: auto;
 }
