@@ -88,8 +88,10 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   color: var(--text-muted);
 }
 .apc-body {
-  white-space: pre-wrap;
-  word-break: break-word;
+  /* NB: no `white-space: pre-wrap` here — it would render the newlines Obsidian
+     leaves between rendered markdown blocks as visible blank lines. pre-wrap is
+     applied inline only during plain-text streaming (see view.ts). */
+  overflow-wrap: anywhere;
   font-size: var(--font-ui-small);
   line-height: var(--line-height-normal);
   padding: var(--size-2-3) var(--size-4-2);

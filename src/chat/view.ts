@@ -207,6 +207,7 @@ export class ChatView extends ItemView {
 
   /** Render markdown (incl. math/code) into a bubble, replacing its contents. */
   private async renderMd(el: HTMLElement, md: string): Promise<void> {
+    el.style.whiteSpace = "normal"; // undo the streaming pre-wrap before rendering blocks
     el.empty();
     await MarkdownRenderer.render(this.app, md, el, "", this);
   }
@@ -251,6 +252,7 @@ export class ChatView extends ItemView {
     this.addBubble("user", q, true);
     this.turns.push({ role: "user", text: q });
     const claudeBody = this.addBubble("claude", "");
+    claudeBody.style.whiteSpace = "pre-wrap"; // readable line breaks while streaming plain text
 
     // "Thinking… Ns" (live) → "Thought for Ns" once the first token arrives.
     const wrap = claudeBody.parentElement as HTMLElement;
