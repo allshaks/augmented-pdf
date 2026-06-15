@@ -1,0 +1,21 @@
+{
+  "name": "augmented-pdf",
+  "version": "0.0.1",
+  "description": "Ask Claude about PDF selections, with accumulating annotations — an Obsidian plugin on top of PDF++.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "spike:claude": "node scripts/spike-claude.mjs"
+  },
+  "keywords": ["obsidian", "pdf", "claude", "annotation"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22",
+    "builtin-modules": "^4",
+    "esbuild": "^0.24",
+    "obsidian": "latest",
+    "typescript": "^5.6"
+  }
+}

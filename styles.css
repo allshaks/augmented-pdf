@@ -1,0 +1,133 @@
+/* Augmented PDF — chat view */
+.augmented-pdf-chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: var(--size-4-2);
+  gap: var(--size-4-2);
+}
+
+.apc-header {
+  flex: 0 0 auto;
+}
+.apc-src {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: var(--size-2-2);
+}
+.apc-quote {
+  margin: 0;
+  padding: var(--size-2-2) var(--size-4-2);
+  border-left: 3px solid var(--interactive-accent);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  max-height: 8em;
+  overflow-y: auto;
+  background: var(--background-secondary);
+  border-radius: var(--radius-s);
+}
+.apc-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding: var(--size-4-4) var(--size-4-2);
+  text-align: center;
+}
+.apc-prior {
+  margin-top: var(--size-2-2);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+}
+
+/* "New chat about this highlight" button rendered inside hub annotation notes */
+.apc-hub-btn {
+  cursor: pointer;
+}
+
+/* Escape hatch: when toggled on, highlights stop intercepting the pointer so the
+   user can drag-select the text underneath (double-click-to-open is disabled meanwhile). */
+body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-backlink {
+  pointer-events: none !important;
+}
+
+.apc-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-3);
+}
+.apc-toolbar-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.apc-toolbar .apc-new,
+.apc-toolbar .apc-save {
+  margin-left: auto;
+  font-size: var(--font-ui-smaller);
+}
+.apc-toolbar .apc-save {
+  margin-left: 0;
+}
+
+.apc-messages {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  padding-right: var(--size-2-2);
+}
+
+.apc-msg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+}
+.apc-role {
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+}
+.apc-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-normal);
+  padding: var(--size-2-3) var(--size-4-2);
+  border-radius: var(--radius-m);
+}
+.apc-user .apc-body {
+  background: var(--background-modifier-hover);
+}
+.apc-claude .apc-body {
+  background: var(--background-secondary);
+}
+.apc-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-top: var(--size-2-1);
+}
+
+.apc-input-row {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-2);
+}
+.apc-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 2.5em;
+  font-size: var(--font-ui-small);
+}
+.apc-buttons {
+  display: flex;
+  gap: var(--size-2-2);
+  justify-content: flex-end;
+}
+
+.apc-status {
+  flex: 0 0 auto;
+  min-height: 1.2em;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}

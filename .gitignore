@@ -1,0 +1,16 @@
+# build / deps
+node_modules/
+main.js
+*.js.map
+
+# obsidian plugin local data
+data.json
+
+# os
+.DS_Store
+
+# spike scratch
+/tmp-spike/
+
+# session/harness state (not project source)
+.remember/

@@ -1,0 +1,9 @@
+{
+  "id": "augmented-pdf",
+  "name": "Augmented PDF (Claude)",
+  "version": "0.0.1",
+  "minAppVersion": "1.6.5",
+  "description": "Ask Claude about a PDF selection; chats are saved as markdown next to the PDF with an accumulating summary on the highlight. Builds on PDF++. Desktop only; requires the Claude CLI.",
+  "author": "",
+  "isDesktopOnly": true
+}
