@@ -59,6 +59,29 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
 };
 
+/**
+ * Convert a CSS color (name or hex) to PDF++'s "r,g,b" link param, so the highlight renders in
+ * that exact color regardless of the user's PDF++ palette. PDF++ treats a comma-triplet as an rgb
+ * color but any other string as a palette NAME (which only renders if defined in their palette,
+ * else falls back to yellow). If the value isn't a valid CSS color, pass it through as a name.
+ */
+function cssColorToRgbParam(color: string): string {
+  try {
+    const el = document.createElement("span");
+    el.style.color = "";
+    el.style.color = color;
+    if (el.style.color === "") return color; // browser rejected it → treat as a PDF++ palette name
+    el.style.display = "none";
+    document.body.appendChild(el);
+    const computed = getComputedStyle(el).color; // e.g. "rgb(91, 155, 213)"
+    el.remove();
+    const m = computed.match(/\d+/g);
+    return m && m.length >= 3 ? `${m[0]},${m[1]},${m[2]}` : color;
+  } catch {
+    return color;
+  }
+}
+
 export default class AugmentedPdfPlugin extends Plugin {
   settings: AugmentedPdfSettings = DEFAULT_SETTINGS;
 
@@ -358,7 +381,7 @@ export default class AugmentedPdfPlugin extends Plugin {
     }
     const excerpt = oneLine(getSelectedText(this.app));
     const alias = (excerpt || `p.${info.page}`).replace(/[[\]|]/g, " ").slice(0, 120);
-    const link = `[[${file.name}#page=${info.page}&selection=${info.selId}&color=${cat.color}|${alias}]]`;
+    const link = `[[${file.name}#page=${info.page}&selection=${info.selId}&color=${cssColorToRgbParam(cat.color)}|${alias}]]`;
     try {
       const lit = await this.resolveLitNoteFile(file);
       await this.app.vault.process(lit, (c) => appendUnderHeading(c, cat.label, `- ${link}`));
