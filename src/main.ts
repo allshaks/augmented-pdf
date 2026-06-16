@@ -17,7 +17,7 @@ import { ChatContext } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
 import { findHub, findNearbyHubs } from "./store/hub";
 import { parseTranscriptTurns } from "./store/transcript";
-import { extractQuotePassage } from "./store/paths";
+import { appendUnderHeading, extractQuotePassage, oneLine, slugify } from "./store/paths";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
@@ -30,16 +30,33 @@ import { countReconcileWork, reconcileAnnotations } from "./reconcile";
  *   - "Write selection link (spike)" + "Preflight" kept as diagnostics.
  */
 
+interface SmartCategory {
+  label: string;
+  color: string;
+}
+
 interface AugmentedPdfSettings {
   claudeBinPath: string;
   model: string; // default model for new chats
   defaultColor: string;
+  smartPaste: boolean;
+  smartCategories: SmartCategory[];
 }
+
+const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
+  { label: "Goal", color: "blue" },
+  { label: "Method", color: "green" },
+  { label: "Result", color: "yellow" },
+  { label: "Background", color: "purple" },
+  { label: "Question", color: "pink" },
+];
 
 const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   claudeBinPath: "claude",
   model: "haiku",
   defaultColor: "yellow",
+  smartPaste: false,
+  smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
 };
 
 export default class AugmentedPdfPlugin extends Plugin {
@@ -138,6 +155,23 @@ export default class AugmentedPdfPlugin extends Plugin {
       name: "Preflight (PDF++ + claude auth)",
       callback: () => void this.preflight(),
     });
+
+    // Smart paste: one bindable command per color category (registered from settings at load).
+    for (const cat of this.settings.smartCategories) {
+      this.addCommand({
+        id: `smart-paste-${slugify(cat.label)}`,
+        name: `Smart paste: ${cat.label}`,
+        checkCallback: (checking: boolean) => {
+          const f = this.app.workspace.getActiveFile();
+          const ok = !!f && f.extension === "pdf";
+          if (ok) {
+            if (!checking) void this.smartPaste(cat);
+            return true;
+          }
+          return false;
+        },
+      });
+    }
 
     console.log("[augmented-pdf] loaded (Phase 1: chat view)");
   }
@@ -279,18 +313,60 @@ export default class AugmentedPdfPlugin extends Plugin {
    * {citekey}.pdf). Primary: same-stem sibling. Fallback: the only markdown note directly in the
    * PDF's folder (our annotation/chat notes live in subfolders, so they don't count).
    */
-  private findLitNote(pdfPath: string, pdfName: string): string | undefined {
+  private findLitNoteFile(pdfPath: string, pdfName: string): TFile | null {
     const stem = pdfName.replace(/\.pdf$/i, "");
     const i = pdfPath.lastIndexOf("/");
     const dir = i >= 0 ? pdfPath.slice(0, i) : "";
     const same = this.app.vault.getAbstractFileByPath((dir ? dir + "/" : "") + stem + ".md");
-    if (same instanceof TFile) return same.basename;
+    if (same instanceof TFile) return same;
     const folder = dir ? this.app.vault.getAbstractFileByPath(dir) : this.app.vault.getRoot();
     if (folder instanceof TFolder) {
       const mds = folder.children.filter((c): c is TFile => c instanceof TFile && c.extension === "md");
-      if (mds.length === 1) return mds[0].basename;
+      if (mds.length === 1) return mds[0];
     }
-    return undefined;
+    return null;
+  }
+
+  private findLitNote(pdfPath: string, pdfName: string): string | undefined {
+    return this.findLitNoteFile(pdfPath, pdfName)?.basename;
+  }
+
+  /** Like findLitNoteFile but creates `<pdf-stem>.md` next to the PDF if none exists. */
+  private async resolveLitNoteFile(pdf: TFile): Promise<TFile> {
+    const existing = this.findLitNoteFile(pdf.path, pdf.name);
+    if (existing) return existing;
+    const dir = pdf.parent && pdf.parent.path !== "/" ? pdf.parent.path : "";
+    const path = (dir ? dir + "/" : "") + pdf.basename + ".md";
+    return this.app.vault.create(path, `# ${pdf.basename}\n`);
+  }
+
+  /** Smart paste: file a colored highlight link under the matching `## <label>` in the lit note. */
+  async smartPaste(cat: SmartCategory): Promise<void> {
+    if (!this.settings.smartPaste) {
+      new Notice("Smart paste is off — enable it in Augmented PDF settings.");
+      return;
+    }
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.extension !== "pdf") {
+      new Notice("Open a PDF and select some text first.");
+      return;
+    }
+    const info = getSelectionInfo(this.app);
+    if (!info) {
+      new Notice("No PDF selection detected (select text, then try again).");
+      return;
+    }
+    const excerpt = oneLine(getSelectedText(this.app));
+    const alias = (excerpt || `p.${info.page}`).replace(/[[\]|]/g, " ").slice(0, 120);
+    const link = `[[${file.name}#page=${info.page}&selection=${info.selId}&color=${cat.color}|${alias}]]`;
+    try {
+      const lit = await this.resolveLitNoteFile(file);
+      await this.app.vault.process(lit, (c) => appendUnderHeading(c, cat.label, `- ${link}`));
+      new Notice(`Smart paste → ${cat.label} · ${lit.basename}`);
+    } catch (e) {
+      console.error("[augmented-pdf] smart paste failed", e);
+      new Notice(`Smart paste failed: ${(e as Error).message}`);
+    }
   }
 
   private isHubNote(file: TFile): boolean {
@@ -427,6 +503,9 @@ export default class AugmentedPdfPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (!Array.isArray(this.settings.smartCategories) || this.settings.smartCategories.length === 0) {
+      this.settings.smartCategories = DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c }));
+    }
   }
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
@@ -475,5 +554,33 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+
+    containerEl.createEl("h3", { text: "Smart paste" });
+    new Setting(containerEl)
+      .setName("Enable smart paste")
+      .setDesc(
+        "Per-color commands that file a colored highlight link under a matching heading in the paper's literature note. Bind a hotkey to each in Settings → Hotkeys (search “Smart paste”)."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.smartPaste).onChange(async (v) => {
+          this.plugin.settings.smartPaste = v;
+          await this.plugin.saveSettings();
+        })
+      );
+    for (const cat of this.plugin.settings.smartCategories) {
+      new Setting(containerEl)
+        .setName(cat.label)
+        .setDesc(`Highlight color (CSS color or a PDF++ palette name). Filed under “## ${cat.label}”.`)
+        .addText((t) =>
+          t.setValue(cat.color).onChange(async (v) => {
+            cat.color = v.trim() || cat.color;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Color edits apply immediately. Renaming/adding categories needs a reload (the per-category commands are registered at startup).",
+    });
   }
 }

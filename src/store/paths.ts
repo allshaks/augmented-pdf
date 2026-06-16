@@ -51,6 +51,25 @@ export function oneLine(s: string): string {
   return s.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Append `line` at the end of the `## <heading>` section, creating the section at EOF if absent.
+ * Used by smart-paste to file colored links under per-category headings in the literature note.
+ */
+export function appendUnderHeading(content: string, heading: string, line: string): string {
+  const esc = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp(`^##[ \\t]+${esc}[ \\t]*$`, "m").exec(content);
+  if (!m) {
+    return content.replace(/[ \t\r\n]*$/, "") + `\n\n## ${heading}\n${line}\n`;
+  }
+  const afterHeading = m.index + m[0].length;
+  const rest = content.slice(afterHeading);
+  const nextRel = rest.search(/^#{1,6}[ \t]+/m); // next heading of any level
+  const insertAt = nextRel >= 0 ? afterHeading + nextRel : content.length;
+  const head = content.slice(0, insertAt).replace(/[ \t\r\n]*$/, "");
+  const tail = content.slice(insertAt);
+  return head + `\n${line}\n` + (tail ? "\n" + tail.replace(/^[ \t\r\n]+/, "") : "");
+}
+
 /** Pull the passage text out of a `> [!quote] …` callout (hub or transcript body). */
 export function extractQuotePassage(content: string): string {
   const m = content.match(/> \[!quote\][^\n]*\n((?:>.*\n?)+)/);
