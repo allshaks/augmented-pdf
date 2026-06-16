@@ -44,11 +44,14 @@ interface AugmentedPdfSettings {
 }
 
 const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
-  { label: "Goal", color: "blue" },
-  { label: "Method", color: "green" },
-  { label: "Result", color: "yellow" },
-  { label: "Background", color: "purple" },
-  { label: "Question", color: "pink" },
+  { label: "Background knowledge", color: "#faf285" },
+  { label: "Definition", color: "#69d929" },
+  { label: "Example", color: "#c4fa71" },
+  { label: "Results", color: "#ffd100" },
+  { label: "Methods and modeling", color: "#e3d9ff" },
+  { label: "Limitations and challenges", color: "#cccccc" },
+  { label: "Note or question", color: "#99c2f1" },
+  { label: "Goal", color: "#ffbf9e" },
 ];
 
 const DEFAULT_SETTINGS: AugmentedPdfSettings = {
@@ -259,7 +262,7 @@ export default class AugmentedPdfPlugin extends Plugin {
       pdfPath: file.path,
       page: info.page,
       selId: info.selId,
-      color: this.settings.defaultColor,
+      color: cssColorToRgbParam(this.settings.defaultColor),
       passage: text,
       litNote: this.findLitNote(file.path, file.name),
     };
@@ -493,7 +496,7 @@ export default class AugmentedPdfPlugin extends Plugin {
       return;
     }
     const color = this.settings.defaultColor;
-    const link = `[[${file.name}#page=${info.page}&selection=${info.selId}&color=${color}|${file.basename}, p.${info.page} (spike)]]`;
+    const link = `[[${file.name}#page=${info.page}&selection=${info.selId}&color=${cssColorToRgbParam(color)}|${file.basename}, p.${info.page} (spike)]]`;
     const notePath = `AugmentedPDF-spike-${Date.now()}.md`;
     const body = `Spike S3 — confirms a PDF++ selection link renders a highlight.\n\n**Source:** ${link}\n`;
     try {
