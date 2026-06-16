@@ -67,6 +67,35 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 .apc-toolbar .apc-save {
   margin-left: 0;
 }
+.apc-skills-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-2-1);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.apc-skills-toggle input {
+  margin: 0;
+}
+.apc-skills-on {
+  margin-top: var(--size-2-2);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-warning, var(--text-accent));
+}
+/* Streaming assistant bubble: text segments + activity lines stacked with separation. */
+.apc-stream {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-1);
+}
+.apc-stream .apc-thinking,
+.apc-stream .apc-thought {
+  margin: 0;
+}
+.apc-error {
+  color: var(--text-error);
+}
 
 .apc-messages {
   flex: 1 1 auto;

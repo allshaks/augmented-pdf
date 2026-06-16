@@ -11,6 +11,35 @@ export const CHAT_VIEW_TYPE = "augmented-pdf-chat";
 
 const SUMMARY_IDLE_MS = 15000;
 
+/** Friendly present-tense label for a tool the model is running mid-stream. */
+function toolVerb(name?: string): string {
+  switch (name) {
+    case "Read":
+      return "Reading…";
+    case "Grep":
+    case "Glob":
+      return "Searching…";
+    case "Write":
+      return "Writing…";
+    case "Edit":
+    case "MultiEdit":
+      return "Editing…";
+    case "Bash":
+      return "Running command…";
+    case "Skill":
+      return "Running skill…";
+    case "Task":
+      return "Working…";
+    case "TodoWrite":
+      return "Planning…";
+    case "WebFetch":
+    case "WebSearch":
+      return "Searching the web…";
+    default:
+      return name ? `Running ${name}…` : "Working…";
+  }
+}
+
 /** Refs captured per-thread so async work survives the thread being reset. */
 interface ThreadRefs {
   ctx: ChatContext;
@@ -21,6 +50,29 @@ interface ThreadRefs {
   hub: TFile;
   transcript: TFile;
   createdISO: string;
+}
+
+/**
+ * A single streaming reply, with ALL the state needed to finish and save itself. This is what
+ * makes "start a new chat while another is thinking" work: when the panel switches, the in-flight
+ * Generation is detached (keeps running) and persists to its own note on completion, independent
+ * of the view's now-reset state.
+ */
+interface Generation {
+  ctx: ChatContext | null;
+  sessionId: string;
+  model: string;
+  turns: Turn[]; // shared ref with this.turns at send() time
+  totalCost: number;
+  hubFile: TFile | null;
+  transcriptFile: TFile | null;
+  createdISO: string | null;
+  entryAppended: boolean;
+  summary: string | null; // last known thread summary (preserved across transcript rewrites)
+  child: ReturnType<typeof runClaude> | null;
+  ticker: number | null;
+  indicator: HTMLElement | null;
+  detached: boolean;
 }
 
 export class ChatView extends ItemView {
@@ -43,8 +95,16 @@ export class ChatView extends ItemView {
   private summarizedTurnCount = 0;
   private summaryTimer: number | null = null;
   private priorContext = "";
-  private activeTicker: number | null = null;
-  private activeIndicator: HTMLElement | null = null;
+  /** The currently-attached streaming reply (null between turns). Detached gens finish on their own. */
+  private activeGen: Generation | null = null;
+  /** Live, SESSION-scoped skill posture (initialized from the persisted default). The toolbar
+   * checkbox flips this only; it does NOT persist, so enabling skills for one run never silently
+   * arms bypassPermissions for future chats. The settings tab sets the persisted default. */
+  private skillsEnabled = false;
+  /** True only for an explicitly-started context-free chat (so the empty panel isn't mislabeled). */
+  private generalChat = false;
+  /** Set once the view is closed, so a backgrounded reply's completion never writes to dead DOM. */
+  private closed = false;
 
   // DOM
   private headerEl!: HTMLElement;
@@ -54,11 +114,13 @@ export class ChatView extends ItemView {
   private stopBtn!: HTMLButtonElement;
   private statusEl!: HTMLElement;
   private modelSelect!: HTMLSelectElement;
+  private skillsToggle!: HTMLInputElement;
 
   constructor(leaf: WorkspaceLeaf, plugin: AugmentedPdfPlugin) {
     super(leaf);
     this.plugin = plugin;
     this.model = plugin.settings.model;
+    this.skillsEnabled = plugin.settings.allowSkills; // session starts at the persisted default
   }
 
   getViewType(): string {
@@ -75,8 +137,10 @@ export class ChatView extends ItemView {
     this.render();
   }
   async onClose(): Promise<void> {
-    this.concludeThread();
-    this.stop();
+    this.closed = true;
+    // Detach an in-flight reply so it finishes + saves in the background even after the panel closes;
+    // otherwise summarize the (idle) thread before leaving.
+    this.prepareSwitch();
   }
 
   private render(): void {
@@ -96,9 +160,26 @@ export class ChatView extends ItemView {
     this.modelSelect.onchange = () => {
       this.model = this.modelSelect.value;
     };
+
+    // Session-scoped quick toggle: flips write-access for THIS chat only (does not persist).
+    // The persisted default lives in settings; here we just override it for the session.
+    const skillsLabel = toolbar.createEl("label", { cls: "apc-skills-toggle" });
+    skillsLabel.setAttr(
+      "title",
+      "Let vault skills write files & run commands for THIS chat (bypassPermissions). " +
+        "Session-only — resets to the settings default next time. Off = read-only."
+    );
+    this.skillsToggle = skillsLabel.createEl("input", { type: "checkbox" });
+    this.skillsToggle.checked = this.skillsEnabled;
+    skillsLabel.createSpan({ text: "Skills" });
+    this.skillsToggle.onchange = () => {
+      this.skillsEnabled = this.skillsToggle.checked;
+      this.renderHeader();
+    };
+
     const newBtn = toolbar.createEl("button", { cls: "apc-new", text: "New chat" });
     newBtn.onclick = () => {
-      this.concludeThread();
+      this.prepareSwitch();
       this.resetThread();
       this.renderHeader();
     };
@@ -132,14 +213,33 @@ export class ChatView extends ItemView {
   private renderHeader(): void {
     this.headerEl.empty();
     if (!this.ctx) {
+      // Explicitly-started general chat vs. the initial empty panel (don't infer from sessionId,
+      // which resetThread always sets — that would mislabel a freshly-cleared empty panel).
+      if (this.generalChat) {
+        this.headerEl.createDiv({ cls: "apc-src", text: "General chat · vault skills" });
+        this.headerEl.createDiv({
+          cls: "apc-prior",
+          text: this.skillsEnabled
+            ? "⚡ Skills on — writes & shell commands enabled; treat all prompt/skill input as trusted. (Not saved to a note.)"
+            : "Read-only — tick “Skills” above to let skills write to the vault. (Not saved to a note.)",
+        });
+        return;
+      }
       this.headerEl.createDiv({
         cls: "apc-empty",
-        text: "Select text in a PDF and choose “Ask Claude about selection”.",
+        text: "Select text in a PDF and choose “Ask Claude about selection”, or run “Ask Claude (general chat / run a vault skill)”.",
       });
       return;
     }
     this.headerEl.createDiv({ cls: "apc-src", text: `${this.ctx.pdfName} · p.${this.ctx.page}` });
     this.headerEl.createEl("blockquote", { cls: "apc-quote", text: this.ctx.passage });
+    if (this.skillsEnabled) {
+      // On-state cue on the higher-risk path: a malicious PDF's text is in this prompt.
+      this.headerEl.createDiv({
+        cls: "apc-skills-on",
+        text: "⚡ Skills on — this chat can write files & run commands.",
+      });
+    }
     if (this.priorContext) {
       const n = (this.priorContext.match(/^### /gm) ?? []).length;
       this.headerEl.createDiv({
@@ -149,9 +249,27 @@ export class ChatView extends ItemView {
     }
   }
 
+  /** Open a context-free chat (no PDF passage) — for vault-wide skills and general Q&A. */
+  startGeneralChat(): void {
+    this.prepareSwitch(); // detach an in-flight reply (keep it running) or summarize the idle thread
+    this.resetThread(); // assigns a fresh session id; clears generalChat — set it below
+    this.ctx = null;
+    this.generalChat = true;
+    this.renderHeader();
+    this.statusEl?.setText("General chat — not saved to a note.");
+    window.setTimeout(() => this.inputEl?.focus(), 0);
+  }
+
+  /** Called by the settings tab when the persisted default changes, so an open panel stays in sync. */
+  applySkillDefault(enabled: boolean): void {
+    this.skillsEnabled = enabled;
+    if (this.skillsToggle) this.skillsToggle.checked = enabled;
+    this.renderHeader();
+  }
+
   /** Seed a NEW chat thread for a selection. */
   setContext(ctx: ChatContext): void {
-    this.concludeThread(); // summarize the outgoing thread before switching
+    this.prepareSwitch(); // detach an in-flight reply (keep it running) or summarize the idle thread
     this.resetThread();
     this.ctx = ctx;
     this.renderHeader();
@@ -171,13 +289,13 @@ export class ChatView extends ItemView {
     createdISO: string;
     summary: string | null;
   }): void {
-    this.concludeThread(); // summarize the outgoing thread first
-    this.stop();
+    this.prepareSwitch(); // detach an in-flight reply (keep it running) or summarize the idle thread
     if (this.summaryTimer !== null) {
       window.clearTimeout(this.summaryTimer);
       this.summaryTimer = null;
     }
     this.ctx = o.ctx;
+    this.generalChat = false;
     this.sessionId = o.sessionId;
     this.turns = o.turns.slice();
     // >0 so the next message --resumes the original session rather than forcing a new id
@@ -205,12 +323,15 @@ export class ChatView extends ItemView {
   }
 
   private resetThread(): void {
-    this.stop();
+    // Callers run prepareSwitch() first (detaches any in-flight reply). This is a safety net: if a
+    // reply is somehow still attached, detach it so it finishes in the background rather than dying.
+    if (this.activeGen) this.detachActiveGen();
     if (this.summaryTimer !== null) {
       window.clearTimeout(this.summaryTimer);
       this.summaryTimer = null;
     }
     this.sessionId = crypto.randomUUID();
+    this.generalChat = false;
     this.turnCount = 0;
     this.totalCost = 0;
     this.turns = [];
@@ -280,12 +401,10 @@ export class ChatView extends ItemView {
       new Notice("A reply is in progress — wait or press Stop.");
       return;
     }
-    if (!this.ctx) {
-      new Notice("No PDF selection. Use “Ask Claude about selection” from a PDF.");
-      return;
-    }
     const q = this.inputEl.value.trim();
     if (!q) return;
+    // No PDF passage required — a context-free chat can still run vault-wide skills / general Q&A.
+    if (!this.sessionId) this.sessionId = crypto.randomUUID();
     this.inputEl.value = "";
     this.autoGrowInput();
 
@@ -296,165 +415,326 @@ export class ChatView extends ItemView {
 
     this.addBubble("user", q, true);
     this.turns.push({ role: "user", text: q });
-    const claudeBody = this.addBubble("claude", "");
-    claudeBody.style.whiteSpace = "pre-wrap"; // readable line breaks while streaming plain text
 
-    // "Thinking… Ns" (live) → "Thought for Ns" once the first token arrives.
-    const wrap = claudeBody.parentElement as HTMLElement;
-    const indicator = wrap.createDiv({ cls: "apc-thinking" });
-    wrap.insertBefore(indicator, claudeBody);
-    indicator.hide();
-    this.activeIndicator = indicator;
-    const t0 = Date.now();
-    let firstText = false;
-    this.clearThinkingTicker();
-    this.activeTicker = window.setInterval(() => {
-      if (firstText) return;
-      const ms = Date.now() - t0;
-      if (ms >= 600) {
-        indicator.setText(`Thinking… ${Math.round(ms / 1000)}s`);
-        indicator.show();
+    // One self-contained Generation per reply, capturing everything needed to finish + save on its
+    // own. `turns` shares the array reference with this.turns; resetThread reassigns this.turns to a
+    // fresh array, so a detached gen keeps the old thread's turns. This is what lets a reply keep
+    // running (and save itself) after the panel switches to a new chat.
+    const gen: Generation = {
+      ctx: this.ctx,
+      sessionId: this.sessionId!,
+      model: this.model,
+      turns: this.turns,
+      totalCost: this.totalCost,
+      hubFile: this.hubFile,
+      transcriptFile: this.transcriptFile,
+      createdISO: this.createdISO,
+      entryAppended: this.entryAppended,
+      summary: this.threadSummary,
+      child: null,
+      ticker: null,
+      indicator: null,
+      detached: false,
+    };
+    this.activeGen = gen;
+
+    // The assistant reply renders as a sequence of segments inside one bubble: each text content
+    // block is its own markdown paragraph, interleaved with live activity lines ("Thinking… Ns",
+    // "Reading…", …) for the model's thinking/tool pauses. Driven by content_block_start (onBlock),
+    // so mid-stream pauses are visible and consecutive text blocks don't glue together.
+    const wrap = this.messagesEl.createDiv({ cls: "apc-msg apc-claude" });
+    wrap.createDiv({ cls: "apc-role", text: "Claude" });
+    const stream = wrap.createDiv({ cls: "apc-stream" });
+    this.scrollToBottom();
+
+    const segments: string[] = []; // finished text segments — joined for persistence
+    let textEl: HTMLElement | null = null; // the currently-streaming text segment (null when detached)
+    let textAcc = "";
+    let inText = false;
+    let activityKind: "thinking" | "tool" | null = null;
+    let activityStart = 0;
+
+    const closeTextSegment = () => {
+      if (!inText) return;
+      segments.push(textAcc);
+      if (!gen.detached && textEl) void this.renderMd(textEl, textAcc); // finalize as markdown
+      textEl = null;
+      textAcc = "";
+      inText = false;
+    };
+    const startTextSegment = () => {
+      inText = true;
+      textAcc = "";
+      textEl = gen.detached ? null : stream.createDiv({ cls: "apc-body" });
+      if (textEl) textEl.style.whiteSpace = "pre-wrap"; // readable while streaming; renderMd resets it
+    };
+    // Convert the live activity line into a static trace (or drop it). Thinking ≥1s leaves
+    // "Thought for Ns" (the indicator the user likes); shorter thinking and any tool pause vanish.
+    const finalizeActivity = () => {
+      if (gen.ticker != null) {
+        window.clearInterval(gen.ticker);
+        gen.ticker = null;
       }
-    }, 250);
-    const finalizeThinking = () => {
-      if (firstText) return;
-      firstText = true;
-      this.clearThinkingTicker();
-      const ms = Date.now() - t0;
-      if (ms >= 1000) {
-        indicator.setText(`Thought for ${(ms / 1000).toFixed(1)}s`);
-        indicator.removeClass("apc-thinking");
-        indicator.addClass("apc-thought");
-        indicator.show();
-      } else {
-        indicator.remove();
+      const el = gen.indicator;
+      gen.indicator = null;
+      if (el) {
+        const ms = Date.now() - activityStart;
+        if (activityKind === "thinking" && ms >= 1000) {
+          el.setText(`Thought for ${(ms / 1000).toFixed(1)}s`);
+          el.removeClass("apc-thinking");
+          el.addClass("apc-thought");
+        } else {
+          el.remove();
+        }
       }
-      this.activeIndicator = null; // finalized — no longer interruptible
+      activityKind = null;
+    };
+    const startActivity = (kind: "thinking" | "tool", label: string) => {
+      activityKind = kind;
+      activityStart = Date.now();
+      if (gen.detached) return; // a backgrounded reply needs no live indicator
+      const el = stream.createDiv({ cls: "apc-thinking" });
+      el.hide();
+      gen.indicator = el;
+      gen.ticker = window.setInterval(() => {
+        const ms = Date.now() - activityStart;
+        if (ms < 350) return; // debounce so sub-350ms blocks never flicker into view
+        el.setText(kind === "thinking" ? `${label} ${Math.round(ms / 1000)}s` : label);
+        el.show();
+        this.scrollToBottom();
+      }, 250);
     };
 
-    let acc = "";
     this.setStreaming(true);
 
     const isFirst = this.turnCount === 0;
-    let sys =
-      `You are helping the user understand a passage from the PDF "${this.ctx.pdfName}" (page ${this.ctx.page}).\n` +
-      `Highlighted passage:\n"""\n${this.ctx.passage}\n"""\n` +
-      `Answer concisely and stay grounded in this passage.`;
-    if (isFirst && this.priorContext) {
+    let sys: string;
+    if (this.ctx) {
+      sys =
+        `You are helping the user understand a passage from the PDF "${this.ctx.pdfName}" (page ${this.ctx.page}).\n` +
+        `Highlighted passage:\n"""\n${this.ctx.passage}\n"""\n` +
+        `Answer concisely and stay grounded in this passage.`;
+      if (isFirst && this.priorContext) {
+        sys +=
+          `\n\nThis passage has been discussed before. Prior chat summaries (for continuity):\n` +
+          this.priorContext;
+      }
+    } else {
+      sys =
+        "You are a helpful assistant working inside the user's Obsidian vault " +
+        "(the current working directory). Answer concisely.";
+    }
+    if (this.skillsEnabled) {
       sys +=
-        `\n\nThis passage has been discussed before. Prior chat summaries (for continuity):\n` +
-        this.priorContext;
+        "\n\nThe vault's Claude Code skills are available (e.g. /capture-idea, /ingest-raw, " +
+        "/query-vault, /find-connections). When the user asks you to capture, save, ingest, query, " +
+        "or otherwise act on the vault, use the appropriate skill; file writes and shell commands " +
+        "are permitted in this vault.";
     }
 
-    this.child = runClaude(
+    gen.child = runClaude(
       {
         binPath: this.plugin.settings.claudeBinPath,
         prompt: q,
         appendSystemPrompt: sys,
-        model: this.model,
-        allowedTools: "Read,Grep,Glob",
-        permissionMode: "dontAsk",
+        model: gen.model,
+        // Skills mode bypasses per-action approval so skills can write/run commands; otherwise
+        // stay read-only (pre-approve only Read/Grep/Glob and deny everything else non-interactively).
+        ...(this.skillsEnabled
+          ? { permissionMode: "bypassPermissions" }
+          : { allowedTools: "Read,Grep,Glob", permissionMode: "dontAsk" }),
         cwd: this.plugin.vaultCwd(),
-        sessionId: isFirst ? this.sessionId ?? undefined : undefined,
-        resumeId: isFirst ? undefined : this.sessionId ?? undefined,
+        sessionId: isFirst ? gen.sessionId : undefined,
+        resumeId: isFirst ? undefined : gen.sessionId,
       },
       {
+        onBlock: (kind, name) => {
+          if (kind === "text") {
+            finalizeActivity(); // "Thinking…" → "Thought for Ns"
+            closeTextSegment(); // safety: close any still-open text block first
+            startTextSegment();
+          } else if (kind === "thinking" || kind === "tool_use") {
+            closeTextSegment(); // capture preceding text + separate it from the pause
+            finalizeActivity();
+            startActivity(kind === "thinking" ? "thinking" : "tool", kind === "thinking" ? "Thinking…" : toolVerb(name));
+          }
+        },
         onText: (t) => {
-          finalizeThinking();
-          acc += t;
-          claudeBody.setText(acc);
-          this.scrollToBottom();
+          if (!inText) {
+            // Defensive: a CLI without content_block_start events still streams text.
+            finalizeActivity();
+            startTextSegment();
+          }
+          textAcc += t;
+          if (!gen.detached && textEl) textEl.setText(textAcc); // skip writes to orphaned DOM
+          if (!gen.detached) this.scrollToBottom();
         },
         onDone: (r) => {
-          if (!firstText) {
-            this.clearThinkingTicker();
-            indicator.remove();
-            this.activeIndicator = null;
+          this.untrackChild(gen);
+          finalizeActivity();
+          closeTextSegment();
+          if (r.costUsd) gen.totalCost += r.costUsd;
+          const reply = segments.join("\n\n").trim();
+          gen.turns.push({ role: "claude", text: reply, costUsd: r.costUsd });
+          if (!gen.detached) {
+            if (!segments.length) {
+              stream.createDiv({ cls: "apc-body", text: r.isError ? "(error — see console)" : "(no response)" });
+            }
+            const meta = wrap.createDiv({ cls: "apc-meta" });
+            meta.setText(`${gen.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${gen.totalCost.toFixed(4)}`);
+            this.scrollToBottom();
           }
-          this.turnCount++;
-          if (r.costUsd) this.totalCost += r.costUsd;
-          // Swap the plain streamed text for rendered markdown now the turn is complete.
-          const finalText = acc || (r.isError ? "(error — see console)" : "");
-          void this.renderMd(claudeBody, finalText).then(() => this.scrollToBottom());
-          const meta = claudeBody.parentElement?.createDiv({ cls: "apc-meta" });
-          meta?.setText(`${this.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${this.totalCost.toFixed(4)}`);
-          this.turns.push({ role: "claude", text: acc, costUsd: r.costUsd });
-          this.child = null;
-          this.setStreaming(false);
-          this.scrollToBottom();
-          void this.persist();
-          this.scheduleSummary();
+          void this.completeGeneration(gen);
         },
         onError: (e) => {
-          if (!firstText) {
-            this.clearThinkingTicker();
-            indicator.remove();
-            this.activeIndicator = null;
-          }
+          this.untrackChild(gen);
+          finalizeActivity();
+          closeTextSegment();
           console.error("[augmented-pdf] chat error", e);
-          claudeBody.setText((acc ? acc + "\n\n" : "") + "⚠️ " + e.message);
-          this.child = null;
-          this.setStreaming(false);
+          if (this.activeGen === gen) {
+            // Attached reply: show the error inline and reset (unchanged behavior).
+            stream.createDiv({ cls: "apc-body apc-error", text: "⚠️ " + e.message });
+            this.activeGen = null;
+            this.child = null;
+            this.setStreaming(false);
+          } else if (gen.detached && gen.ctx) {
+            // Backgrounded reply failed: we promised to save it, so persist whatever streamed plus an
+            // error marker, and tell the user (the bubble left with the switched-away panel).
+            const partial = segments.join("\n\n").trim();
+            gen.turns.push({ role: "claude", text: (partial ? partial + "\n\n" : "") + `⚠️ (reply failed: ${e.message})` });
+            new Notice("A background chat hit an error — saved what it had to its note.");
+            void this.completeGeneration(gen);
+          }
         },
       }
     );
+    this.child = gen.child;
+    if (gen.child) this.plugin.liveChildren.add(gen.child);
   }
 
+  /** Stop tracking a generation's child once it has terminated (so onunload doesn't try to re-kill). */
+  private untrackChild(gen: Generation): void {
+    if (gen.child) this.plugin.liveChildren.delete(gen.child);
+  }
+
+  /** Stop and discard the active reply (the Stop button). Detached/background replies are unaffected. */
   private stop(): void {
-    if (this.child) {
-      try {
-        this.child.kill();
-      } catch {
-        /* ignore */
+    const gen = this.activeGen;
+    if (gen) {
+      this.untrackChild(gen);
+      if (gen.child) {
+        try {
+          gen.child.kill();
+        } catch {
+          /* ignore */
+        }
       }
-      this.child = null;
+      if (gen.ticker != null) {
+        window.clearInterval(gen.ticker);
+        gen.ticker = null;
+      }
+      gen.indicator?.remove();
+      gen.indicator = null;
+      this.activeGen = null;
     }
-    this.clearThinkingTicker();
-    if (this.activeIndicator) {
-      this.activeIndicator.remove();
-      this.activeIndicator = null;
-    }
+    this.child = null;
     if (this.sendBtn) this.setStreaming(false);
   }
 
-  private clearThinkingTicker(): void {
-    if (this.activeTicker != null) {
-      window.clearInterval(this.activeTicker);
-      this.activeTicker = null;
+  /**
+   * Detach the in-flight reply so it keeps running and saves itself in the background — the panel is
+   * then free for a new chat. (Background-continue; see Generation.)
+   */
+  private detachActiveGen(): void {
+    const gen = this.activeGen;
+    if (!gen) return;
+    gen.detached = true;
+    if (gen.ticker != null) {
+      window.clearInterval(gen.ticker); // stop animating the (soon-cleared) indicator
+      gen.ticker = null;
+    }
+    this.activeGen = null;
+    this.child = null;
+    this.setStreaming(false);
+    if (gen.child) new Notice("Earlier chat is still working — it'll be saved to its note when done.");
+  }
+
+  /** Before switching chats: detach an in-flight reply (keep it running) or summarize the idle one. */
+  private prepareSwitch(): void {
+    if (this.activeGen && this.child) this.detachActiveGen();
+    else this.concludeThread();
+  }
+
+  /**
+   * Persist a finished generation, then summarize it. Works for the active thread AND a detached
+   * (background) one. Only syncs state back into the view if the gen is still the attached thread.
+   */
+  private async completeGeneration(gen: Generation): Promise<void> {
+    const attached = this.activeGen === gen; // false once detached or switched away
+    if (attached) {
+      this.child = null;
+      this.activeGen = null;
+      this.turnCount++;
+      this.totalCost = gen.totalCost;
+      this.setStreaming(false);
+    }
+    if (!gen.ctx) {
+      if (attached) this.statusEl?.setText("General chat — not saved to a note.");
+      return; // general chats aren't saved
+    }
+    if (!gen.turns.some((t) => t.role === "claude")) return;
+    try {
+      await this.persistGen(gen);
+      // Re-check identity AFTER the await: if the user switched chats during persistence, this.* now
+      // belongs to a different thread, so don't sync into it — just finish the gen in the background.
+      const stillActive = attached && this.ctx === gen.ctx && this.sessionId === gen.sessionId;
+      if (stillActive) {
+        this.hubFile = gen.hubFile;
+        this.transcriptFile = gen.transcriptFile;
+        this.createdISO = gen.createdISO;
+        this.entryAppended = gen.entryAppended;
+        this.statusEl?.setText(`Saved · annotation: ${gen.hubFile?.basename ?? ""}`);
+        this.scheduleSummary(); // idle summary of the active thread
+      } else if (gen.hubFile && gen.transcriptFile) {
+        await this.summarizeThread({
+          ctx: gen.ctx,
+          sessionId: gen.sessionId,
+          model: gen.model,
+          turns: gen.turns.slice(),
+          totalCost: gen.totalCost,
+          hub: gen.hubFile,
+          transcript: gen.transcriptFile,
+          createdISO: gen.createdISO ?? moment().format(),
+        });
+      }
+    } catch (e) {
+      console.error("[augmented-pdf] completeGeneration failed", e);
+      if (attached) this.statusEl?.setText("Save failed (see console)");
     }
   }
 
-  /** Create/update the transcript and ensure a hub entry exists for this thread. */
-  private async persist(): Promise<void> {
-    if (!this.ctx || !this.sessionId) return;
-    if (!this.turns.some((t) => t.role === "claude")) return;
-    try {
-      if (!this.createdISO) this.createdISO = moment().format();
-      if (!this.hubFile) this.hubFile = await findOrCreateHub(this.plugin.app, this.ctx);
-
-      this.transcriptFile = await writeTranscript(this.plugin.app, this.ctx, {
-        file: this.transcriptFile,
-        sessionId: this.sessionId,
-        model: this.model,
-        turns: this.turns,
-        totalCost: this.totalCost,
-        hubBasename: this.hubFile.basename,
-        createdISO: this.createdISO,
-        summary: this.threadSummary,
+  /** Create/update the transcript and ensure a hub entry exists for a generation's thread. */
+  private async persistGen(gen: Generation): Promise<void> {
+    if (!gen.ctx || !gen.sessionId) return;
+    if (!gen.createdISO) gen.createdISO = moment().format();
+    if (!gen.hubFile) gen.hubFile = await findOrCreateHub(this.plugin.app, gen.ctx);
+    gen.transcriptFile = await writeTranscript(this.plugin.app, gen.ctx, {
+      file: gen.transcriptFile,
+      sessionId: gen.sessionId,
+      model: gen.model,
+      turns: gen.turns,
+      totalCost: gen.totalCost,
+      hubBasename: gen.hubFile.basename,
+      createdISO: gen.createdISO,
+      summary: gen.summary,
+    });
+    if (!gen.entryAppended) {
+      await appendChatEntry(this.plugin.app, gen.hubFile, {
+        anchorId: gen.sessionId,
+        title: oneLine(gen.turns.find((t) => t.role === "user")?.text ?? "Chat").slice(0, 80),
+        transcriptBasename: gen.transcriptFile.basename,
       });
-
-      if (!this.entryAppended) {
-        await appendChatEntry(this.plugin.app, this.hubFile, {
-          anchorId: this.sessionId,
-          title: oneLine(this.turns.find((t) => t.role === "user")?.text ?? "Chat").slice(0, 80),
-          transcriptBasename: this.transcriptFile.basename,
-        });
-        this.entryAppended = true;
-      }
-      this.statusEl.setText(`Saved · annotation: ${this.hubFile.basename}`);
-    } catch (e) {
-      console.error("[augmented-pdf] persist failed", e);
-      this.statusEl.setText("Save failed (see console)");
+      gen.entryAppended = true;
     }
   }
 
@@ -509,8 +789,9 @@ export class ChatView extends ItemView {
         createdISO: refs.createdISO,
         summary,
       });
-      // Reflect in the live UI only if still the same thread.
-      if (this.sessionId === refs.sessionId) {
+      // Reflect in the live UI only if still the same thread AND the panel is still open
+      // (a backgrounded reply can finish after the view closed — don't write to dead DOM).
+      if (!this.closed && this.sessionId === refs.sessionId) {
         this.threadSummary = summary;
         this.statusEl.setText(`Summarized · annotation: ${refs.hub.basename}`);
       }

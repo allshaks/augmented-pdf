@@ -67,7 +67,16 @@ export async function findOrCreateHub(app: App, ctx: ChatContext): Promise<TFile
   const folder = annotationsFolder(ctx.pdfPath, ctx.pdfName);
   await ensureFolder(app, folder);
   const path = `${folder}/${hubKey(ctx.page, ctx.selId)} — ${slugify(ctx.passage)}.md`;
-  return app.vault.create(path, hubTemplate(ctx));
+  try {
+    return await app.vault.create(path, hubTemplate(ctx));
+  } catch (e) {
+    // Idempotent under races: a concurrent generation on the SAME highlight may have created the
+    // hub between our findHub() and create(). Return the now-existing file instead of throwing
+    // (which would lose this generation's transcript + entry). See background-continue (Generation).
+    const found = findHub(app, ctx) ?? app.vault.getAbstractFileByPath(path);
+    if (found instanceof TFile) return found;
+    throw e;
+  }
 }
 
 function hubTemplate(ctx: ChatContext): string {

@@ -42,6 +42,13 @@ export interface ClaudeResult {
 export interface ClaudeHandlers {
   /** Called for each streamed text chunk (token-ish granularity). */
   onText?: (text: string) => void;
+  /**
+   * Called at the start of each assistant content block (a `content_block_start` stream event).
+   * `kind` is the Anthropic block type — "thinking", "tool_use", "text", etc. For "tool_use",
+   * `name` is the tool (e.g. "Read"). Lets the UI show mid-stream "Thinking…/Running…" indicators
+   * and separate consecutive text blocks (verified shapes — see scripts/spike + PLAN §7).
+   */
+  onBlock?: (kind: string, name?: string) => void;
   /** Raw event tap — useful for surfacing tool-use status or debugging. */
   onEvent?: (type: string | undefined, raw: unknown) => void;
   /** Final result envelope. */
@@ -118,12 +125,14 @@ function dispatch(line: string, handlers: ClaudeHandlers): void {
   }
   handlers.onEvent?.(evt?.type, evt);
 
-  if (
-    evt?.type === "stream_event" &&
-    evt.event?.type === "content_block_delta" &&
-    evt.event.delta?.type === "text_delta"
-  ) {
-    handlers.onText?.(evt.event.delta.text as string);
+  if (evt?.type === "stream_event") {
+    const ev = evt.event;
+    if (ev?.type === "content_block_start") {
+      const cb = ev.content_block ?? {};
+      handlers.onBlock?.(cb.type as string, cb.name as string | undefined);
+    } else if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+      handlers.onText?.(ev.delta.text as string);
+    }
   } else if (evt?.type === "result") {
     handlers.onDone?.({
       sessionId: evt.session_id,

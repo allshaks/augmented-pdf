@@ -41,6 +41,13 @@ interface AugmentedPdfSettings {
   defaultColor: string;
   smartPaste: boolean;
   smartCategories: SmartCategory[];
+  /**
+   * When true, chat runs the CLI with `--permission-mode bypassPermissions` so vault skills
+   * (e.g. /capture-idea, /ingest-raw) can write files and run shell commands. When false (default),
+   * the chat is read-only (`Read,Grep,Glob` + `dontAsk`). Off by default for safety — see the
+   * warning in the settings tab.
+   */
+  allowSkills: boolean;
 }
 
 const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
@@ -60,6 +67,7 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   defaultColor: "yellow",
   smartPaste: false,
   smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
+  allowSkills: false,
 };
 
 /**
@@ -87,6 +95,21 @@ function cssColorToRgbParam(color: string): string {
 
 export default class AugmentedPdfPlugin extends Plugin {
   settings: AugmentedPdfSettings = DEFAULT_SETTINGS;
+
+  /** Live `claude` child processes across all chats (incl. detached/background replies), tracked so
+   *  we can kill them on plugin unload — otherwise a reply in flight at disable/reload is orphaned. */
+  readonly liveChildren = new Set<{ kill(): void }>();
+
+  onunload(): void {
+    for (const c of this.liveChildren) {
+      try {
+        c.kill();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.liveChildren.clear();
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -122,6 +145,11 @@ export default class AugmentedPdfPlugin extends Plugin {
       // Default Cmd/Ctrl+Esc — rebindable in Settings → Hotkeys.
       hotkeys: [{ modifiers: ["Mod"], key: "Escape" }],
       callback: () => void this.openChatForSelection(),
+    });
+    this.addCommand({
+      id: "ask-claude-general-chat",
+      name: "Ask Claude (general chat / run a vault skill)",
+      callback: () => void this.openGeneralChat(),
     });
     this.addCommand({
       id: "new-chat-on-annotation",
@@ -291,6 +319,16 @@ export default class AugmentedPdfPlugin extends Plugin {
       return;
     }
     view.setContext(ctx);
+  }
+
+  /** Open a context-free chat (no PDF passage) — for vault-wide skills and general Q&A. */
+  private async openGeneralChat(): Promise<void> {
+    const view = await this.activateChatView();
+    if (!view) {
+      new Notice("Couldn't open the chat panel.");
+      return;
+    }
+    view.startGeneralChat();
   }
 
   /** Rename/move the sibling (annotations)/(chats) folders when a PDF is renamed or moved. */
@@ -580,6 +618,29 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+
+    containerEl.createEl("h3", { text: "Vault skills" });
+    new Setting(containerEl)
+      .setName("Allow skills & file writes (default)")
+      .setDesc(
+        "Default for new chats. Lets chats run your vault's Claude Code skills (e.g. /capture-idea, " +
+          "/ingest-raw, /query-vault) — they can create/edit files and run shell commands in the vault. " +
+          "Runs the CLI with bypassPermissions (no per-action approval). Off keeps chats read-only " +
+          "(Read/Grep/Glob). You can also flip it per-chat with the “Skills” toggle in the chat panel. " +
+          "⚠️ Only enable for vaults you trust: any text in the prompt — highlighted PDF text, anything " +
+          "you paste, or a file a skill reads — could try to misuse the write/shell access. Leave it off " +
+          "unless you need writes."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.allowSkills).onChange(async (v) => {
+          this.plugin.settings.allowSkills = v;
+          await this.plugin.saveSettings();
+          // Keep any open chat panel's session toggle in sync with the new persisted default.
+          for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
+            if (leaf.view instanceof ChatView) leaf.view.applySkillDefault(v);
+          }
+        })
+      );
 
     containerEl.createEl("h3", { text: "Smart paste" });
     new Setting(containerEl)
