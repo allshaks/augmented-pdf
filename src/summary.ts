@@ -24,8 +24,16 @@ export function summarizeConversation(plugin: AugmentedPdfPlugin, convo: string)
       {
         binPath: plugin.settings.claudeBinPath,
         prompt:
-          "Summarize the key conclusions of the following conversation in 2-3 sentences. " +
-          "Output ONLY the summary as plain prose — no preamble, no markdown headings.\n\n" +
+          // Synthesize the WHOLE conversation, not just the last exchange. The summary is regenerated
+          // and overwritten on every turn, so it must reflect the full arc up to this point —
+          // otherwise a late topic drift erases the substantive core (the failure we're fixing).
+          "Below is a Q&A conversation between a user and an assistant about a highlighted passage " +
+          "from a document. Write a synthesis of the ENTIRE conversation so far: the core question(s) " +
+          "the user is working through and the key insights, answers, and partial or tentative " +
+          "conclusions reached across ALL exchanges. Weight by intellectual substance — do NOT " +
+          "over-emphasize the final message, and ignore procedural or tool-use chatter (e.g. asking " +
+          "which skills are available, running commands). Output ONLY the summary as 2-4 sentences of " +
+          "plain prose — no preamble, no markdown headings, no bullet points.\n\n" +
           convo,
         model: "haiku",
         permissionMode: "dontAsk",
