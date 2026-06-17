@@ -13,11 +13,11 @@ import {
 } from "obsidian";
 import { execFile } from "child_process";
 import { CHAT_VIEW_TYPE, ChatView } from "./chat/view";
-import { ChatContext } from "./types";
+import { ChatContext, EFFORT_LEVELS } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
 import { findHub, findNearbyHubs } from "./store/hub";
 import { parseTranscriptTurns } from "./store/transcript";
-import { appendUnderHeading, extractQuotePassage, oneLine, slugify } from "./store/paths";
+import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify } from "./store/paths";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
@@ -38,6 +38,7 @@ interface SmartCategory {
 interface AugmentedPdfSettings {
   claudeBinPath: string;
   model: string; // default model for new chats
+  effort: string; // default reasoning effort: "default" (CLI default) | low | medium | high | xhigh | max
   defaultColor: string;
   smartPaste: boolean;
   smartCategories: SmartCategory[];
@@ -64,6 +65,7 @@ const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
 const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   claudeBinPath: "claude",
   model: "haiku",
+  effort: "default",
   defaultColor: "yellow",
   smartPaste: false,
   smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
@@ -473,6 +475,34 @@ export default class AugmentedPdfPlugin extends Plugin {
     view.setContext(ctx);
   }
 
+  /** All saved chat transcripts for a paper (newest first) — powers the in-panel chat picker. */
+  async listPaperChats(
+    pdfPath: string,
+    pdfName: string
+  ): Promise<{ file: TFile; label: string; created: number }[]> {
+    const folder = this.app.vault.getAbstractFileByPath(chatsFolder(pdfPath, pdfName));
+    if (!(folder instanceof TFolder)) return [];
+    const out: { file: TFile; label: string; created: number }[] = [];
+    for (const child of folder.children) {
+      if (!(child instanceof TFile) || child.extension !== "md") continue;
+      const fm = this.app.metadataCache.getFileCache(child)?.frontmatter;
+      if (!fm || fm["augmented-pdf"] !== "transcript") continue;
+      const createdMs = fm.created ? Date.parse(String(fm.created)) : child.stat.ctime;
+      // Label = the opening question; fall back to the summary, then the filename.
+      let label = "";
+      try {
+        const m = (await this.app.vault.cachedRead(child)).match(/^##\s+You\s*\n([^\n]+)/m);
+        label = m ? oneLine(m[1]) : "";
+      } catch {
+        /* ignore read errors */
+      }
+      if (!label) label = fm.summary ? oneLine(String(fm.summary)) : child.basename;
+      out.push({ file: child, label: label.slice(0, 80), created: isNaN(createdMs) ? 0 : createdMs });
+    }
+    out.sort((a, b) => b.created - a.created);
+    return out;
+  }
+
   /** Load an existing chat from its transcript note into the sidebar (resumes its session). */
   async openChatFromTranscript(file: TFile): Promise<void> {
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
@@ -611,6 +641,17 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Default reasoning effort")
+      .setDesc("Default for new chats (changeable per chat in the panel). “Default” uses the CLI's own default.")
+      .addDropdown((d) => {
+        for (const lvl of EFFORT_LEVELS) d.addOption(lvl, lvl);
+        d.setValue(this.plugin.settings.effort).onChange(async (v) => {
+          this.plugin.settings.effort = v;
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(containerEl).setName("Highlight color").addText((t) =>
       t.setValue(this.plugin.settings.defaultColor).onChange(async (v) => {

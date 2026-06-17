@@ -1,6 +1,6 @@
-import { ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
+import { ItemView, MarkdownRenderer, Menu, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
 import { runClaude } from "../claude/runner";
-import { ChatContext, Turn } from "../types";
+import { ChatContext, EFFORT_LEVELS, Turn } from "../types";
 import { appendChatEntry, findHub, findOrCreateHub, readPriorSummaries, updateEntrySummary } from "../store/hub";
 import { writeTranscript } from "../store/transcript";
 import { generateSummary } from "../summary";
@@ -84,6 +84,7 @@ export class ChatView extends ItemView {
   private totalCost = 0;
   private turns: Turn[] = [];
   private model: string;
+  private effort: string; // session reasoning effort (toolbar); "default" => omit --effort
   private child: ReturnType<typeof runClaude> | null = null;
 
   // persistence state
@@ -120,6 +121,7 @@ export class ChatView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.model = plugin.settings.model;
+    this.effort = plugin.settings.effort;
     this.skillsEnabled = plugin.settings.allowSkills; // session starts at the persisted default
   }
 
@@ -159,6 +161,16 @@ export class ChatView extends ItemView {
     }
     this.modelSelect.onchange = () => {
       this.model = this.modelSelect.value;
+    };
+
+    toolbar.createSpan({ cls: "apc-toolbar-label", text: "Effort" });
+    const effortSelect = toolbar.createEl("select", { cls: "dropdown apc-effort" });
+    for (const lvl of EFFORT_LEVELS) {
+      const o = effortSelect.createEl("option", { text: lvl, value: lvl });
+      if (lvl === this.effort) o.selected = true;
+    }
+    effortSelect.onchange = () => {
+      this.effort = effortSelect.value;
     };
 
     // Session-scoped quick toggle: flips write-access for THIS chat only (does not persist).
@@ -231,7 +243,11 @@ export class ChatView extends ItemView {
       });
       return;
     }
-    this.headerEl.createDiv({ cls: "apc-src", text: `${this.ctx.pdfName} · p.${this.ctx.page}` });
+    const srcRow = this.headerEl.createDiv({ cls: "apc-src-row" });
+    srcRow.createDiv({ cls: "apc-src", text: `${this.ctx.pdfName} · p.${this.ctx.page}` });
+    const picker = srcRow.createEl("button", { cls: "apc-chats-btn", text: "Chats ▾" });
+    picker.setAttr("title", "Open another chat saved for this paper");
+    picker.onclick = (evt) => void this.showChatPicker(evt);
     this.headerEl.createEl("blockquote", { cls: "apc-quote", text: this.ctx.passage });
     if (this.skillsEnabled) {
       // On-state cue on the higher-risk path: a malicious PDF's text is in this prompt.
@@ -247,6 +263,28 @@ export class ChatView extends ItemView {
         text: `${n} previous chat${n === 1 ? "" : "s"} on this highlight — context included.`,
       });
     }
+  }
+
+  /** Popup menu listing every saved chat for the current paper; selecting one re-opens it. */
+  private async showChatPicker(evt: MouseEvent): Promise<void> {
+    if (!this.ctx) {
+      new Notice("Open a chat from a PDF passage first.");
+      return;
+    }
+    const entries = await this.plugin.listPaperChats(this.ctx.pdfPath, this.ctx.pdfName);
+    if (!entries.length) {
+      new Notice("No saved chats for this paper yet.");
+      return;
+    }
+    const menu = new Menu();
+    for (const e of entries) {
+      menu.addItem((item) => {
+        item.setTitle(e.label);
+        if (this.transcriptFile && e.file.path === this.transcriptFile.path) item.setChecked(true);
+        item.onClick(() => void this.plugin.openChatFromTranscript(e.file));
+      });
+    }
+    menu.showAtMouseEvent(evt);
   }
 
   /** Open a context-free chat (no PDF passage) — for vault-wide skills and general Q&A. */
@@ -538,6 +576,7 @@ export class ChatView extends ItemView {
         prompt: q,
         appendSystemPrompt: sys,
         model: gen.model,
+        effort: this.effort && this.effort !== "default" ? this.effort : undefined,
         // Skills mode bypasses per-action approval so skills can write/run commands; otherwise
         // stay read-only (pre-approve only Read/Grep/Glob and deny everything else non-interactively).
         ...(this.skillsEnabled

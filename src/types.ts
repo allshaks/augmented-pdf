@@ -14,3 +14,9 @@ export interface Turn {
   text: string;
   costUsd?: number;
 }
+
+/**
+ * Reasoning-effort choices for the chat. "default" means omit --effort (use the CLI's own default);
+ * the rest map directly to `claude --effort <level>`.
+ */
+export const EFFORT_LEVELS = ["default", "low", "medium", "high", "xhigh", "max"] as const;

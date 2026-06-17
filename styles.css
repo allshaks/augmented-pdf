@@ -52,8 +52,23 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 .apc-toolbar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--size-2-3);
+}
+.apc-toolbar .apc-effort {
+  max-width: 6.5em;
+}
+.apc-src-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--size-2-3);
+}
+.apc-chats-btn {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  padding: 0 var(--size-2-2);
 }
 .apc-toolbar-label {
   font-size: var(--font-ui-smaller);

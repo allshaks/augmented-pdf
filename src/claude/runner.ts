@@ -26,6 +26,8 @@ export interface RunClaudeOptions {
   resumeId?: string;
   appendSystemPrompt?: string;
   model?: string;
+  /** Reasoning effort: "low" | "medium" | "high" | "xhigh" | "max". Omit for the CLI default. */
+  effort?: string;
   /** e.g. "Read,Grep,Glob" — read-only by default in our design. */
   allowedTools?: string;
   /** e.g. "dontAsk" — non-interactive. */
@@ -70,6 +72,7 @@ export function buildArgs(opts: RunClaudeOptions): string[] {
   if (opts.resumeId) args.push("--resume", opts.resumeId);
   if (opts.appendSystemPrompt) args.push("--append-system-prompt", opts.appendSystemPrompt);
   if (opts.model) args.push("--model", opts.model);
+  if (opts.effort) args.push("--effort", opts.effort);
   if (opts.allowedTools) args.push("--allowedTools", opts.allowedTools);
   if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
   return args;
