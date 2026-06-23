@@ -1,5 +1,6 @@
 import { runClaude } from "./claude/runner";
 import { Turn } from "./types";
+import { toObsidianMath } from "./format";
 import type AugmentedPdfPlugin from "./main";
 
 /**
@@ -27,23 +28,34 @@ export function summarizeConversation(plugin: AugmentedPdfPlugin, convo: string)
           // Synthesize the WHOLE conversation, not just the last exchange. The summary is regenerated
           // and overwritten on every turn, so it must reflect the full arc up to this point —
           // otherwise a late topic drift erases the substantive core (the failure we're fixing).
-          "Below is a Q&A conversation between a user and an assistant about a highlighted passage " +
-          "from a document. Write a synthesis of the ENTIRE conversation so far: the core question(s) " +
-          "the user is working through and the key insights, answers, and partial or tentative " +
-          "conclusions reached across ALL exchanges. Weight by intellectual substance — do NOT " +
-          "over-emphasize the final message, and ignore procedural or tool-use chatter (e.g. asking " +
-          "which skills are available, running commands). Output ONLY the summary as 2-4 sentences of " +
-          "plain prose — no preamble, no markdown headings, no bullet points.\n\n" +
+          // Voice: first-person plural ("we"), anchored by a positive one-shot example (a neutral
+          // domain, so it teaches the voice/shape without biasing the content of real summaries).
+          "Below is a Q&A conversation about a highlighted passage from a document. Write a synthesis " +
+          "of the ENTIRE conversation so far: the core question(s) explored and the key insights and " +
+          "partial or tentative conclusions reached across ALL exchanges. Weight by intellectual " +
+          "substance — do not over-emphasize the final message, and ignore procedural or tool-use " +
+          "chatter.\n\n" +
+          "Write in the first person plural (\"we\"), in a natural, reflective voice — as if recounting " +
+          "what we worked out together. Output ONLY the summary as 2-4 sentences of plain prose: no " +
+          "preamble, no headings, no bullet points.\n\n" +
+          "Here is an example of the voice and shape to aim for (a different topic — match the style, " +
+          "not the content):\n" +
+          "\"We worked through why the author treats the boundary as fixed, and whether that assumption " +
+          "survives once feedback is added. We landed on a tentative view that it holds in the short " +
+          "run but breaks over longer horizons, leaving open how best to model the transition.\"\n\n" +
+          "Now summarize this conversation in that voice:\n\n" +
           convo,
         model: "haiku",
         permissionMode: "dontAsk",
         cwd: plugin.vaultCwd(),
+        settingSources: "project,local", // skip the user-level remember hook (stalls on the iCloud vault)
+        noMcp: true, // don't connect claude.ai connectors at startup (intermittent stall source)
       },
       {
         onText: (t) => {
           acc += t;
         },
-        onDone: (r) => resolve(r.isError ? null : (r.result ?? acc).trim() || null),
+        onDone: (r) => resolve(r.isError ? null : toObsidianMath((r.result ?? acc).trim()) || null),
         onError: () => resolve(null),
       }
     );

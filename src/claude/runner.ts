@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from "child_process";
+import { stripControlChars } from "../format";
 
 /**
  * ClaudeRunner — drives the `claude` CLI in streaming (stream-json) mode.
@@ -32,6 +33,20 @@ export interface RunClaudeOptions {
   allowedTools?: string;
   /** e.g. "dontAsk" — non-interactive. */
   permissionMode?: string;
+  /**
+   * Which settings sources to load, e.g. "project,local". We pass "project,local" to SKIP user-level
+   * settings — specifically the remember plugin's SessionStart hook, which runs on every call and
+   * touches the iCloud-backed vault, intermittently stalling startup for minutes. Auth (OAuth/
+   * keychain) and the vault's own .claude/skills are unaffected. Omit to load all sources.
+   */
+  settingSources?: string;
+  /**
+   * When true, disable ALL MCP: emits `--strict-mcp-config --mcp-config {"mcpServers":{}}`. This stops
+   * the CLI from connecting to the account's claude.ai connectors (Gmail/Drive/etc.) at startup —
+   * those connect with a 30s timeout each *before* any output, so a slow/unreachable connector stalls
+   * the whole call (the root cause of the intermittent "no response" hangs). The plugin needs no MCP.
+   */
+  noMcp?: boolean;
 }
 
 export interface ClaudeResult {
@@ -75,7 +90,11 @@ export function buildArgs(opts: RunClaudeOptions): string[] {
   if (opts.effort) args.push("--effort", opts.effort);
   if (opts.allowedTools) args.push("--allowedTools", opts.allowedTools);
   if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
-  return args;
+  if (opts.settingSources) args.push("--setting-sources", opts.settingSources);
+  if (opts.noMcp) args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+  // spawn() throws synchronously if ANY arg has a NUL byte — and PDF-extracted passages (in the
+  // prompt / system prompt) sometimes do. Strip control chars from every arg defensively.
+  return args.map(stripControlChars);
 }
 
 export function runClaude(opts: RunClaudeOptions, handlers: ClaudeHandlers): ChildProcess {
@@ -88,6 +107,15 @@ export function runClaude(opts: RunClaudeOptions, handlers: ClaudeHandlers): Chi
 
   let buf = "";
   let stderr = "";
+  // Guarantee exactly one terminal callback. Without this, a process that exits 0 (or is killed)
+  // *without* emitting a `result` line fires neither onDone nor onError, leaving the UI stuck on
+  // "Thinking…" forever. `settled` flips on the first terminal event (result or error).
+  let settled = false;
+  const fail = (err: Error) => {
+    if (settled) return;
+    settled = true;
+    handlers.onError?.(err);
+  };
 
   child.stdout?.setEncoding("utf8");
   child.stdout?.on("data", (chunk: string) => {
@@ -96,7 +124,7 @@ export function runClaude(opts: RunClaudeOptions, handlers: ClaudeHandlers): Chi
     while ((nl = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
-      if (line) dispatch(line, handlers);
+      if (line && dispatch(line, handlers)) settled = true;
     }
   });
 
@@ -105,26 +133,26 @@ export function runClaude(opts: RunClaudeOptions, handlers: ClaudeHandlers): Chi
     stderr += c;
   });
 
-  child.on("error", (e) => handlers.onError?.(e));
+  child.on("error", (e) => fail(e));
 
   child.on("close", (code) => {
-    if (buf.trim()) dispatch(buf.trim(), handlers); // flush trailing line
-    if (code !== 0 && code !== null) {
-      handlers.onError?.(
-        new Error(`claude exited with code ${code}${stderr ? `: ${stderr.slice(0, 500)}` : ""}`)
-      );
-    }
+    if (buf.trim() && dispatch(buf.trim(), handlers)) settled = true; // flush trailing line
+    if (settled) return; // onDone already delivered
+    const tail = stderr ? `: ${stderr.slice(0, 500)}` : "";
+    if (code !== 0 && code !== null) fail(new Error(`claude exited with code ${code}${tail}`));
+    else fail(new Error(`claude exited without a result (code ${code ?? "killed"})${tail}`));
   });
 
   return child;
 }
 
-function dispatch(line: string, handlers: ClaudeHandlers): void {
+/** Returns true iff this line was the terminal `result` event (so the caller can mark it settled). */
+function dispatch(line: string, handlers: ClaudeHandlers): boolean {
   let evt: any;
   try {
     evt = JSON.parse(line);
   } catch {
-    return; // ignore non-JSON noise
+    return false; // ignore non-JSON noise
   }
   handlers.onEvent?.(evt?.type, evt);
 
@@ -136,6 +164,7 @@ function dispatch(line: string, handlers: ClaudeHandlers): void {
     } else if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") {
       handlers.onText?.(ev.delta.text as string);
     }
+    return false;
   } else if (evt?.type === "result") {
     handlers.onDone?.({
       sessionId: evt.session_id,
@@ -143,5 +172,7 @@ function dispatch(line: string, handlers: ClaudeHandlers): void {
       result: evt.result,
       costUsd: evt.total_cost_usd,
     });
+    return true;
   }
+  return false;
 }

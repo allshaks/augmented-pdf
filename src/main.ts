@@ -18,6 +18,7 @@ import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
 import { findHub, findNearbyHubs } from "./store/hub";
 import { parseTranscriptTurns } from "./store/transcript";
 import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify } from "./store/paths";
+import { stripControlChars } from "./format";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
@@ -278,7 +279,9 @@ export default class AugmentedPdfPlugin extends Plugin {
   private async openChatForSelection(): Promise<void> {
     const file = this.app.workspace.getActiveFile();
     const info = getSelectionInfo(this.app);
-    const text = getSelectedText(this.app);
+    // PDF text extraction can yield NUL/control bytes; strip them so they never reach the prompt
+    // (which would crash spawn) or the saved notes.
+    const text = stripControlChars(getSelectedText(this.app));
     if (!file || file.extension !== "pdf") {
       new Notice("Open a PDF and select some text first.");
       return;

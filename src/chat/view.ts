@@ -5,6 +5,7 @@ import { appendChatEntry, findHub, findOrCreateHub, readPriorSummaries, updateEn
 import { writeTranscript } from "../store/transcript";
 import { generateSummary } from "../summary";
 import { oneLine } from "../store/paths";
+import { toObsidianMath } from "../format";
 import type AugmentedPdfPlugin from "../main";
 
 export const CHAT_VIEW_TYPE = "augmented-pdf-chat";
@@ -413,7 +414,20 @@ export class ChatView extends ItemView {
   private async renderMd(el: HTMLElement, md: string): Promise<void> {
     el.style.whiteSpace = "normal"; // undo the streaming pre-wrap before rendering blocks
     el.empty();
-    await MarkdownRenderer.render(this.app, md, el, "", this);
+    let text = md;
+    try {
+      text = toObsidianMath(md);
+    } catch (e) {
+      console.warn("[augmented-pdf] toObsidianMath failed; rendering raw", e);
+    }
+    try {
+      await MarkdownRenderer.render(this.app, text, el, "", this);
+    } catch (e) {
+      // Never let a render failure (e.g. a MathJax choke) blank the bubble or break the turn.
+      console.error("[augmented-pdf] markdown render failed; showing plain text", e);
+      el.style.whiteSpace = "pre-wrap";
+      el.setText(md);
+    }
   }
 
   /** Grow the input textarea to fit its content, up to a cap (then it scrolls). */
@@ -569,8 +583,41 @@ export class ChatView extends ItemView {
         "or otherwise act on the vault, use the appropriate skill; file writes and shell commands " +
         "are permitted in this vault.";
     }
+    sys +=
+      "\n\nFor math, use Obsidian MathJax: $...$ inline and $$...$$ for display; never \\( \\) or \\[ \\].";
 
-    gen.child = runClaude(
+    // When the account is out of its usage window, the CLI emits a rate_limit_event then blocks
+    // (silently, possibly for hours) waiting for the reset. Surface that clearly and stop, since
+    // retrying would just re-hit the same limit.
+    let rateLimitHandled = false;
+    const handleRateLimited = (info: { resetsAt?: number; rateLimitType?: string }) => {
+      if (rateLimitHandled) return;
+      rateLimitHandled = true;
+      this.untrackChild(gen);
+      try {
+        gen.child?.kill();
+      } catch {
+        /* ignore */
+      }
+      finalizeActivity();
+      closeTextSegment();
+      const when = info?.resetsAt ? moment(info.resetsAt * 1000).format("ddd HH:mm") : "later";
+      const kind = info?.rateLimitType === "five_hour" ? "5-hour usage limit" : "usage limit";
+      if (!gen.detached) {
+        stream.createDiv({
+          cls: "apc-body apc-error",
+          text: `⏳ Claude ${kind} reached — paused until it resets (${when}). This is your Claude plan limit, not a plugin error; try again then.`,
+        });
+      }
+      if (this.activeGen === gen) {
+        this.activeGen = null;
+        this.child = null;
+        this.setStreaming(false);
+      }
+    };
+
+    try {
+      gen.child = runClaude(
       {
         binPath: this.plugin.settings.claudeBinPath,
         prompt: q,
@@ -583,10 +630,24 @@ export class ChatView extends ItemView {
           ? { permissionMode: "bypassPermissions" }
           : { allowedTools: "Read,Grep,Glob", permissionMode: "dontAsk" }),
         cwd: this.plugin.vaultCwd(),
+        // Skip user-level settings (the remember plugin's SessionStart hook) — it runs on every call
+        // and stalls startup on the iCloud vault. Keeps auth + the vault's own .claude/skills.
+        settingSources: "project,local",
+        // Disable MCP so the account's claude.ai connectors don't connect (30s each) at startup.
+        noMcp: true,
         sessionId: isFirst ? gen.sessionId : undefined,
         resumeId: isFirst ? undefined : gen.sessionId,
       },
       {
+        onEvent: (type, raw) => {
+          if (type === "rate_limit_event") {
+            const info = (raw as { rate_limit_info?: { status?: string; resetsAt?: number; rateLimitType?: string } })
+              ?.rate_limit_info;
+            const status = String(info?.status ?? "");
+            // "allowed"/"allowed_warning" mean the call proceeds; anything else = blocked on the limit.
+            if (status && !status.startsWith("allowed")) handleRateLimited(info ?? {});
+          }
+        },
         onBlock: (kind, name) => {
           if (kind === "text") {
             finalizeActivity(); // "Thinking…" → "Thought for Ns"
@@ -613,7 +674,7 @@ export class ChatView extends ItemView {
           finalizeActivity();
           closeTextSegment();
           if (r.costUsd) gen.totalCost += r.costUsd;
-          const reply = segments.join("\n\n").trim();
+          const reply = toObsidianMath(segments.join("\n\n").trim());
           gen.turns.push({ role: "claude", text: reply, costUsd: r.costUsd });
           if (!gen.detached) {
             if (!segments.length) {
@@ -639,7 +700,7 @@ export class ChatView extends ItemView {
           } else if (gen.detached && gen.ctx) {
             // Backgrounded reply failed: we promised to save it, so persist whatever streamed plus an
             // error marker, and tell the user (the bubble left with the switched-away panel).
-            const partial = segments.join("\n\n").trim();
+            const partial = toObsidianMath(segments.join("\n\n").trim());
             gen.turns.push({ role: "claude", text: (partial ? partial + "\n\n" : "") + `⚠️ (reply failed: ${e.message})` });
             new Notice("A background chat hit an error — saved what it had to its note.");
             void this.completeGeneration(gen);
@@ -647,8 +708,36 @@ export class ChatView extends ItemView {
         },
       }
     );
+    } catch (e) {
+      // spawn() can throw synchronously (e.g. a NUL byte in an arg, or resource exhaustion). Without
+      // this the throw escapes send() and leaves the panel stuck on "Thinking…". Recover immediately.
+      const msg = (e as Error)?.message ?? String(e);
+      console.error("[augmented-pdf] spawn failed", e);
+      finalizeActivity();
+      closeTextSegment();
+      stream.createDiv({ cls: "apc-body apc-error", text: "⚠️ Couldn't start Claude: " + msg });
+      this.activeGen = null;
+      this.child = null;
+      this.setStreaming(false);
+      return;
+    }
     this.child = gen.child;
     if (gen.child) this.plugin.liveChildren.add(gen.child);
+    if (!gen.child?.pid) {
+      // Spawned object with no PID = the process never came up, and no 'error' event may fire.
+      finalizeActivity();
+      closeTextSegment();
+      stream.createDiv({ cls: "apc-body apc-error", text: "⚠️ Couldn't start Claude (no process). Try again." });
+      this.untrackChild(gen);
+      try {
+        gen.child?.kill();
+      } catch {
+        /* ignore */
+      }
+      this.activeGen = null;
+      this.child = null;
+      this.setStreaming(false);
+    }
   }
 
   /** Stop tracking a generation's child once it has terminated (so onunload doesn't try to re-kill). */
