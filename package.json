@@ -1,6 +1,6 @@
 {
   "name": "augmented-pdf",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Ask Claude about PDF selections, with accumulating annotations — an Obsidian plugin on top of PDF++.",
   "main": "main.js",
   "scripts": {
