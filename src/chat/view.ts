@@ -103,10 +103,17 @@ export class ChatView extends ItemView {
    * checkbox flips this only; it does NOT persist, so enabling skills for one run never silently
    * arms bypassPermissions for future chats. The settings tab sets the persisted default. */
   private skillsEnabled = false;
+  /** Live, SESSION-scoped web posture (initialized from the persisted default). Pre-approves the
+   * read-only WebSearch/WebFetch tools so the model can look things up online. The toolbar checkbox
+   * flips this only; it does NOT persist. The settings tab sets the persisted default. */
+  private webEnabled = false;
   /** True only for an explicitly-started context-free chat (so the empty panel isn't mislabeled). */
   private generalChat = false;
   /** Set once the view is closed, so a backgrounded reply's completion never writes to dead DOM. */
   private closed = false;
+  /** Auto-scroll only while pinned to the bottom; cleared when the user scrolls up (so streaming
+   *  doesn't yank them back down), restored when they scroll back to the bottom. */
+  private stickToBottom = true;
 
   // DOM
   private headerEl!: HTMLElement;
@@ -117,6 +124,7 @@ export class ChatView extends ItemView {
   private statusEl!: HTMLElement;
   private modelSelect!: HTMLSelectElement;
   private skillsToggle!: HTMLInputElement;
+  private webToggle!: HTMLInputElement;
 
   constructor(leaf: WorkspaceLeaf, plugin: AugmentedPdfPlugin) {
     super(leaf);
@@ -124,6 +132,7 @@ export class ChatView extends ItemView {
     this.model = plugin.settings.model;
     this.effort = plugin.settings.effort;
     this.skillsEnabled = plugin.settings.allowSkills; // session starts at the persisted default
+    this.webEnabled = plugin.settings.allowWeb; // ditto for web access
   }
 
   getViewType(): string {
@@ -190,6 +199,21 @@ export class ChatView extends ItemView {
       this.renderHeader();
     };
 
+    // Session-scoped quick toggle: lets the model search the web for THIS chat only (does not persist).
+    // Read-only — pre-approves WebSearch/WebFetch without unlocking writes/shell (that's "Skills").
+    const webLabel = toolbar.createEl("label", { cls: "apc-skills-toggle" });
+    webLabel.setAttr(
+      "title",
+      "Let the model search the web & fetch URLs for THIS chat (read-only). " +
+        "Session-only — resets to the settings default next time. Off = no internet access."
+    );
+    this.webToggle = webLabel.createEl("input", { type: "checkbox" });
+    this.webToggle.checked = this.webEnabled;
+    webLabel.createSpan({ text: "Web" });
+    this.webToggle.onchange = () => {
+      this.webEnabled = this.webToggle.checked;
+    };
+
     const newBtn = toolbar.createEl("button", { cls: "apc-new", text: "New chat" });
     newBtn.onclick = () => {
       this.prepareSwitch();
@@ -197,7 +221,19 @@ export class ChatView extends ItemView {
       this.renderHeader();
     };
 
+    // Vault-wide picker — reachable from any state, so a previous chat can be reopened even from the
+    // empty/default panel (the in-header "Chats ▾" only lists the current paper's chats).
+    const openBtn = toolbar.createEl("button", { cls: "apc-open", text: "Open chat" });
+    openBtn.setAttr("title", "Open a saved chat from any paper");
+    openBtn.onclick = () => void this.plugin.openChatPicker();
+
     this.messagesEl = root.createDiv({ cls: "apc-messages" });
+    // Track whether the user is pinned to the bottom. This fires on programmatic scrolls too (which
+    // land at the bottom → stays pinned) and on user scrolls (scrolling up unpins → streaming stops
+    // yanking them down; scrolling back to the bottom re-pins).
+    this.registerDomEvent(this.messagesEl, "scroll", () => {
+      this.stickToBottom = this.isNearBottom();
+    });
 
     const inputRow = root.createDiv({ cls: "apc-input-row" });
     this.inputEl = inputRow.createEl("textarea", {
@@ -240,7 +276,7 @@ export class ChatView extends ItemView {
       }
       this.headerEl.createDiv({
         cls: "apc-empty",
-        text: "Select text in a PDF and choose “Ask Claude about selection”, or run “Ask Claude (general chat / run a vault skill)”.",
+        text: "Select text in a PDF and choose “Ask Claude about selection”, or run “Ask Claude (general chat / run a vault skill)”. You can also reopen a saved chat with “Open chat” above.",
       });
       return;
     }
@@ -306,6 +342,12 @@ export class ChatView extends ItemView {
     this.renderHeader();
   }
 
+  /** Called by the settings tab when the persisted web default changes, so an open panel stays in sync. */
+  applyWebDefault(enabled: boolean): void {
+    this.webEnabled = enabled;
+    if (this.webToggle) this.webToggle.checked = enabled;
+  }
+
   /** Seed a NEW chat thread for a selection. */
   setContext(ctx: ChatContext): void {
     this.prepareSwitch(); // detach an in-flight reply (keep it running) or summarize the idle thread
@@ -355,6 +397,7 @@ export class ChatView extends ItemView {
     this.messagesEl.empty();
     this.statusEl.setText(`Loaded chat · ${o.transcriptFile.basename}`);
     this.renderHeader();
+    this.stickToBottom = true; // loading a chat → show its latest
     for (const t of this.turns) this.addBubble(t.role, t.text, true);
     this.scrollToBottom();
     window.setTimeout(() => this.inputEl?.focus(), 0);
@@ -381,6 +424,7 @@ export class ChatView extends ItemView {
     this.entryAppended = false;
     this.summarizedTurnCount = 0;
     this.priorContext = "";
+    this.stickToBottom = true;
     this.messagesEl?.empty();
     this.statusEl?.setText("");
   }
@@ -406,7 +450,7 @@ export class ChatView extends ItemView {
     const body = wrap.createDiv({ cls: "apc-body" });
     if (markdown && text) void this.renderMd(body, text);
     else body.setText(text);
-    this.scrollToBottom();
+    this.autoScroll();
     return body;
   }
 
@@ -441,6 +485,17 @@ export class ChatView extends ItemView {
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
 
+  /** Is the view scrolled to (within ~60px of) the bottom? */
+  private isNearBottom(): boolean {
+    const el = this.messagesEl;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  }
+
+  /** Scroll to the bottom only if the user hasn't scrolled up (used for streaming/thinking updates). */
+  private autoScroll(): void {
+    if (this.stickToBottom) this.scrollToBottom();
+  }
+
   private setStreaming(on: boolean): void {
     this.sendBtn.toggle(!on);
     this.stopBtn.toggle(on);
@@ -455,8 +510,10 @@ export class ChatView extends ItemView {
     }
     const q = this.inputEl.value.trim();
     if (!q) return;
-    // No PDF passage required — a context-free chat can still run vault-wide skills / general Q&A.
-    if (!this.sessionId) this.sessionId = crypto.randomUUID();
+    // Mint a FRESH session id for every first-turn attempt (turnCount === 0), so retrying after a
+    // failed turn 1 never reuses an id the CLI already registered ("Session ID … is already in use").
+    // Continuations (turnCount > 0) keep the established id and --resume it.
+    if (this.turnCount === 0 || !this.sessionId) this.sessionId = crypto.randomUUID();
     this.inputEl.value = "";
     this.autoGrowInput();
 
@@ -465,6 +522,7 @@ export class ChatView extends ItemView {
       this.summaryTimer = null;
     }
 
+    this.stickToBottom = true; // sending re-pins to the bottom to show the new turn
     this.addBubble("user", q, true);
     this.turns.push({ role: "user", text: q });
 
@@ -553,7 +611,7 @@ export class ChatView extends ItemView {
         if (ms < 350) return; // debounce so sub-350ms blocks never flicker into view
         el.setText(kind === "thinking" ? `${label} ${Math.round(ms / 1000)}s` : label);
         el.show();
-        this.scrollToBottom();
+        this.autoScroll();
       }, 250);
     };
 
@@ -616,6 +674,11 @@ export class ChatView extends ItemView {
       }
     };
 
+    // Read-only allow-list for non-skills mode. WebSearch/WebFetch are appended only when the user
+    // enabled web access (toolbar "Web" toggle / settings default) — web is read-only but also an
+    // exfiltration channel, so it's opt-in. In skills mode, bypassPermissions already allows web.
+    const readOnlyTools = this.webEnabled ? "Read,Grep,Glob,WebSearch,WebFetch" : "Read,Grep,Glob";
+
     try {
       gen.child = runClaude(
       {
@@ -624,11 +687,11 @@ export class ChatView extends ItemView {
         appendSystemPrompt: sys,
         model: gen.model,
         effort: this.effort && this.effort !== "default" ? this.effort : undefined,
-        // Skills mode bypasses per-action approval so skills can write/run commands; otherwise
-        // stay read-only (pre-approve only Read/Grep/Glob and deny everything else non-interactively).
+        // Skills mode bypasses per-action approval so skills can write/run commands; otherwise stay
+        // read-only — pre-approve readOnlyTools (Read/Grep/Glob, +web when enabled), deny the rest.
         ...(this.skillsEnabled
           ? { permissionMode: "bypassPermissions" }
-          : { allowedTools: "Read,Grep,Glob", permissionMode: "dontAsk" }),
+          : { allowedTools: readOnlyTools, permissionMode: "dontAsk" }),
         cwd: this.plugin.vaultCwd(),
         // Skip user-level settings (the remember plugin's SessionStart hook) — it runs on every call
         // and stalls startup on the iCloud vault. Keeps auth + the vault's own .claude/skills.
@@ -667,22 +730,32 @@ export class ChatView extends ItemView {
           }
           textAcc += t;
           if (!gen.detached && textEl) textEl.setText(textAcc); // skip writes to orphaned DOM
-          if (!gen.detached) this.scrollToBottom();
+          if (!gen.detached) this.autoScroll();
         },
         onDone: (r) => {
           this.untrackChild(gen);
           finalizeActivity();
           closeTextSegment();
           if (r.costUsd) gen.totalCost += r.costUsd;
-          const reply = toObsidianMath(segments.join("\n\n").trim());
+          let reply = toObsidianMath(segments.join("\n\n").trim());
+          // is_error result = the CLI completed but the API/run errored (often transient: overloaded,
+          // a network blip, a usage limit). Surface the actual reason and log the full envelope.
+          let errDetail = "";
+          if (r.isError) {
+            errDetail = (String(r.result || "").trim() || r.subtype || "unknown error").slice(0, 400);
+            console.error("[augmented-pdf] result error:", r.raw);
+            if (!reply) reply = `⚠️ (error: ${errDetail})`;
+          }
           gen.turns.push({ role: "claude", text: reply, costUsd: r.costUsd });
           if (!gen.detached) {
-            if (!segments.length) {
-              stream.createDiv({ cls: "apc-body", text: r.isError ? "(error — see console)" : "(no response)" });
+            if (r.isError) {
+              stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${errDetail} — often transient; try again.` });
+            } else if (!segments.length) {
+              stream.createDiv({ cls: "apc-body", text: "(no response)" });
             }
             const meta = wrap.createDiv({ cls: "apc-meta" });
             meta.setText(`${gen.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${gen.totalCost.toFixed(4)}`);
-            this.scrollToBottom();
+            this.autoScroll();
           }
           void this.completeGeneration(gen);
         },

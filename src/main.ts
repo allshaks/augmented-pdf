@@ -1,5 +1,6 @@
 import {
   App,
+  ColorComponent,
   FileSystemAdapter,
   Menu,
   Notice,
@@ -7,6 +8,7 @@ import {
   PluginSettingTab,
   Setting,
   TAbstractFile,
+  TextComponent,
   TFile,
   TFolder,
   WorkspaceLeaf,
@@ -17,9 +19,10 @@ import { ChatContext, EFFORT_LEVELS } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
 import { findHub, findNearbyHubs } from "./store/hub";
 import { parseTranscriptTurns } from "./store/transcript";
-import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify } from "./store/paths";
+import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify, stemOf } from "./store/paths";
 import { stripControlChars } from "./format";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
+import { AllChatsModal, ChatPickerEntry } from "./modals/allChats";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
 /**
@@ -50,6 +53,14 @@ interface AugmentedPdfSettings {
    * warning in the settings tab.
    */
   allowSkills: boolean;
+  /**
+   * When true, chat pre-approves the WebSearch/WebFetch tools so the model can search the web and
+   * read URLs (read-only — no file writes or shell). When false (default), the chat has no internet
+   * access. Off by default because web access is also a data-exfiltration channel: a malicious
+   * passage could try to make the model encode conversation text into a fetched URL. Flip per-chat
+   * with the "Web" toggle in the chat panel, or set the default here.
+   */
+  allowWeb: boolean;
 }
 
 const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
@@ -71,6 +82,7 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   smartPaste: false,
   smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
   allowSkills: false,
+  allowWeb: false,
 };
 
 /**
@@ -96,12 +108,40 @@ function cssColorToRgbParam(color: string): string {
   }
 }
 
+/**
+ * Resolve a CSS color (name or hex) to "#rrggbb" for the visual color picker, or null if it isn't a
+ * real CSS color (e.g. a PDF++ palette name) — in which case the swatch keeps its current value and
+ * the free-form text field remains the source of truth.
+ */
+function cssColorToHex(color: string): string | null {
+  try {
+    const el = document.createElement("span");
+    el.style.color = "";
+    el.style.color = color;
+    if (el.style.color === "") return null;
+    el.style.display = "none";
+    document.body.appendChild(el);
+    const computed = getComputedStyle(el).color; // "rgb(r, g, b)" / "rgba(r, g, b, a)"
+    el.remove();
+    const m = computed.match(/\d+/g);
+    if (!m || m.length < 3) return null;
+    const h = (n: string) => Number(n).toString(16).padStart(2, "0");
+    return `#${h(m[0])}${h(m[1])}${h(m[2])}`;
+  } catch {
+    return null;
+  }
+}
+
 export default class AugmentedPdfPlugin extends Plugin {
   settings: AugmentedPdfSettings = DEFAULT_SETTINGS;
 
   /** Live `claude` child processes across all chats (incl. detached/background replies), tracked so
    *  we can kill them on plugin unload — otherwise a reply in flight at disable/reload is orphaned. */
   readonly liveChildren = new Set<{ kill(): void }>();
+
+  /** Full ids of the per-category smart-paste commands currently registered, so we can remove the
+   *  stale ones when categories are added/removed/renamed in settings (re-registration). */
+  private smartPasteCommandIds: string[] = [];
 
   onunload(): void {
     for (const c of this.liveChildren) {
@@ -213,11 +253,38 @@ export default class AugmentedPdfPlugin extends Plugin {
       callback: () => void this.preflight(),
     });
 
-    // Smart paste: one bindable command per color category (registered from settings at load).
+    // Smart paste: one bindable command per color category. Re-registerable so settings edits
+    // (add / remove / rename) take effect without a reload.
+    this.registerSmartPasteCommands();
+
+    console.log("[augmented-pdf] loaded (Phase 1: chat view)");
+  }
+
+  /**
+   * (Re)register the per-category "Smart paste: <label>" commands from the current settings. Called at
+   * load and after the settings tab edits categories, so add/remove/rename take effect immediately.
+   * Removes previously-registered commands first so renamed/deleted categories don't leave stale ones.
+   */
+  registerSmartPasteCommands(): void {
+    const commands = (this.app as unknown as { commands?: { removeCommand?: (id: string) => void } }).commands;
+    for (const fullId of this.smartPasteCommandIds) {
+      try {
+        commands?.removeCommand?.(fullId);
+      } catch {
+        /* removeCommand is semi-private; if unavailable, stale commands clear on next reload */
+      }
+    }
+    this.smartPasteCommandIds = [];
+    const seen = new Set<string>();
     for (const cat of this.settings.smartCategories) {
+      const label = cat.label?.trim();
+      if (!label) continue; // a blank label gets no command
+      const id = `smart-paste-${slugify(label)}`;
+      if (seen.has(id)) continue; // duplicate label → a single command (ids must stay unique)
+      seen.add(id);
       this.addCommand({
-        id: `smart-paste-${slugify(cat.label)}`,
-        name: `Smart paste: ${cat.label}`,
+        id,
+        name: `Smart paste: ${label}`,
         checkCallback: (checking: boolean) => {
           const f = this.app.workspace.getActiveFile();
           const ok = !!f && f.extension === "pdf";
@@ -228,9 +295,8 @@ export default class AugmentedPdfPlugin extends Plugin {
           return false;
         },
       });
+      this.smartPasteCommandIds.push(`${this.manifest.id}:${id}`);
     }
-
-    console.log("[augmented-pdf] loaded (Phase 1: chat view)");
   }
 
   /** Wire the PDF++ context menu once everything is loaded. */
@@ -506,6 +572,44 @@ export default class AugmentedPdfPlugin extends Plugin {
     return out;
   }
 
+  /**
+   * Every saved chat transcript across the whole vault (newest first) — powers the global picker
+   * reachable from the empty/default panel. Frontmatter (`augmented-pdf: transcript`) is read from
+   * the metadata cache; only matched files are read (for the opening-question label).
+   */
+  async listAllChats(): Promise<ChatPickerEntry[]> {
+    const out: ChatPickerEntry[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (!fm || fm["augmented-pdf"] !== "transcript") continue;
+      const createdMs = fm.created ? Date.parse(String(fm.created)) : file.stat.ctime;
+      const pdfRaw = String(fm.pdf ?? "").replace(/^\[\[|\]\]$/g, "").trim();
+      const paper = pdfRaw ? stemOf(pdfRaw) : "";
+      // Label = the opening question; fall back to the summary, then the filename (mirrors listPaperChats).
+      let label = "";
+      try {
+        const m = (await this.app.vault.cachedRead(file)).match(/^##\s+You\s*\n([^\n]+)/m);
+        label = m ? oneLine(m[1]) : "";
+      } catch {
+        /* ignore read errors */
+      }
+      if (!label) label = fm.summary ? oneLine(String(fm.summary)) : file.basename;
+      out.push({ file, paper, label: label.slice(0, 100), created: isNaN(createdMs) ? 0 : createdMs });
+    }
+    out.sort((a, b) => b.created - a.created);
+    return out;
+  }
+
+  /** Open the vault-wide chat picker (works from any panel state, including the empty/default one). */
+  async openChatPicker(): Promise<void> {
+    const entries = await this.listAllChats();
+    if (!entries.length) {
+      new Notice("No saved chats yet — start one from a PDF selection.");
+      return;
+    }
+    new AllChatsModal(this.app, entries, (e) => void this.openChatFromTranscript(e.file)).open();
+  }
+
   /** Load an existing chat from its transcript note into the sidebar (resumes its session). */
   async openChatFromTranscript(file: TFile): Promise<void> {
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
@@ -600,7 +704,8 @@ export default class AugmentedPdfPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    if (!Array.isArray(this.settings.smartCategories) || this.settings.smartCategories.length === 0) {
+    // Seed defaults only when the field is missing/corrupt — an intentionally-emptied list is respected.
+    if (!Array.isArray(this.settings.smartCategories)) {
       this.settings.smartCategories = DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c }));
     }
   }
@@ -686,6 +791,27 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
         })
       );
 
+    containerEl.createEl("h3", { text: "Web access" });
+    new Setting(containerEl)
+      .setName("Allow web search & fetch (default)")
+      .setDesc(
+        "Default for new chats. Lets the model use WebSearch and WebFetch to look things up online " +
+          "and read URLs (read-only — it can't write files or run commands). You can also flip it " +
+          "per-chat with the “Web” toggle in the chat panel. ⚠️ Web access is also an exfiltration " +
+          "channel: text in the prompt (e.g. a highlighted PDF passage) could try to make the model " +
+          "put conversation content into a fetched URL. Leave it off unless you want online lookups."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.allowWeb).onChange(async (v) => {
+          this.plugin.settings.allowWeb = v;
+          await this.plugin.saveSettings();
+          // Keep any open chat panel's session toggle in sync with the new persisted default.
+          for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
+            if (leaf.view instanceof ChatView) leaf.view.applyWebDefault(v);
+          }
+        })
+      );
+
     containerEl.createEl("h3", { text: "Smart paste" });
     new Setting(containerEl)
       .setName("Enable smart paste")
@@ -698,20 +824,78 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-    for (const cat of this.plugin.settings.smartCategories) {
-      new Setting(containerEl)
-        .setName(cat.label)
-        .setDesc(`Highlight color (CSS color or a PDF++ palette name). Filed under “## ${cat.label}”.`)
-        .addText((t) =>
-          t.setValue(cat.color).onChange(async (v) => {
-            cat.color = v.trim() || cat.color;
+    new Setting(containerEl)
+      .setName("Categories")
+      .setDesc(
+        "Each row is a “Smart paste: <label>” command (bind a hotkey in Settings → Hotkeys) that files the " +
+          "highlight link under a “## <label>” heading. Pick a color with the swatch, or type a hex / CSS " +
+          "color name (or a PDF++ palette name) in the field. Add/remove apply live — no reload needed."
+      );
+
+    this.plugin.settings.smartCategories.forEach((cat, i) => {
+      let picker: ColorComponent | undefined;
+      let colorText: TextComponent | undefined;
+      const row = new Setting(containerEl);
+      row.settingEl.addClass("apc-cat-row");
+      // Editable label. Re-register commands on blur (not per keystroke) so the command name tracks it.
+      row.addText((t) => {
+        t.setPlaceholder("Label (e.g. Definitions)")
+          .setValue(cat.label)
+          .onChange(async (v) => {
+            cat.label = v;
             await this.plugin.saveSettings();
+          });
+        t.inputEl.addClass("apc-cat-label");
+        t.inputEl.addEventListener("blur", () => this.plugin.registerSmartPasteCommands());
+      });
+      // Visual RGB swatch — writes a hex value and mirrors it into the text field.
+      row.addColorPicker((cp) => {
+        picker = cp;
+        const hex = cssColorToHex(cat.color);
+        if (hex) cp.setValue(hex);
+        cp.onChange(async (v) => {
+          cat.color = v;
+          colorText?.setValue(v);
+          await this.plugin.saveSettings();
+        });
+      });
+      // Free-form color: hex / CSS name / PDF++ palette name — kept in sync with the swatch.
+      row.addText((t) => {
+        colorText = t;
+        t.setPlaceholder("#rrggbb / name / palette")
+          .setValue(cat.color)
+          .onChange(async (v) => {
+            cat.color = v.trim() || cat.color;
+            const hex = cssColorToHex(cat.color);
+            if (hex) picker?.setValue(hex);
+            await this.plugin.saveSettings();
+          });
+        t.inputEl.addClass("apc-cat-color");
+      });
+      // Remove this category (commands re-register, list re-renders).
+      row.addExtraButton((b) =>
+        b
+          .setIcon("trash-2")
+          .setTooltip("Remove this category")
+          .onClick(async () => {
+            this.plugin.settings.smartCategories.splice(i, 1);
+            await this.plugin.saveSettings();
+            this.plugin.registerSmartPasteCommands();
+            this.display();
           })
-        );
-    }
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text: "Color edits apply immediately. Renaming/adding categories needs a reload (the per-category commands are registered at startup).",
+      );
     });
+
+    new Setting(containerEl).addButton((b) =>
+      b
+        .setButtonText("+ Add category")
+        .setCta()
+        .onClick(async () => {
+          this.plugin.settings.smartCategories.push({ label: "New category", color: "#ffd100" });
+          await this.plugin.saveSettings();
+          this.plugin.registerSmartPasteCommands();
+          this.display();
+        })
+    );
   }
 }

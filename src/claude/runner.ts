@@ -54,6 +54,10 @@ export interface ClaudeResult {
   isError: boolean;
   result?: string;
   costUsd?: number;
+  /** Result envelope subtype, e.g. "success" | "error_during_execution" | "error_max_turns". */
+  subtype?: string;
+  /** The full result envelope — for logging/diagnosing an error result. */
+  raw?: unknown;
 }
 
 export interface ClaudeHandlers {
@@ -171,6 +175,8 @@ function dispatch(line: string, handlers: ClaudeHandlers): boolean {
       isError: !!evt.is_error,
       result: evt.result,
       costUsd: evt.total_cost_usd,
+      subtype: evt.subtype,
+      raw: evt,
     });
     return true;
   }

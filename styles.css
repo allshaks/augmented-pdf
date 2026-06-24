@@ -82,6 +82,31 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 .apc-toolbar .apc-save {
   margin-left: 0;
 }
+.apc-toolbar .apc-open {
+  font-size: var(--font-ui-smaller);
+}
+.apc-suggest-sub {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+/* Smart-paste category editor: drop the empty info column so the label/swatch/color/trash controls
+   form one left-aligned, wrapping strip per row. */
+.apc-cat-row .setting-item-info {
+  display: none;
+}
+.apc-cat-row .setting-item-control {
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: var(--size-2-2);
+}
+.apc-cat-row .apc-cat-label {
+  flex: 1 1 10em;
+  min-width: 8em;
+}
+.apc-cat-row .apc-cat-color {
+  width: 11em;
+}
 .apc-skills-toggle {
   display: inline-flex;
   align-items: center;
