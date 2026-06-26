@@ -23,6 +23,9 @@ import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify,
 import { stripControlChars } from "./format";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { AllChatsModal, ChatPickerEntry } from "./modals/allChats";
+import { readGlossary } from "./store/glossary";
+import { startGlossaryBuild } from "./glossaryGen";
+import { GlossaryLookupModal } from "./modals/glossaryLookup";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
 /**
@@ -61,6 +64,8 @@ interface AugmentedPdfSettings {
    * with the "Web" toggle in the chat panel, or set the default here.
    */
   allowWeb: boolean;
+  /** Model used to build per-PDF glossaries (Claude reads the PDF): "sonnet" (default) | "haiku". */
+  glossaryModel: string;
 }
 
 const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
@@ -83,6 +88,7 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   smartCategories: DEFAULT_SMART_CATEGORIES.map((c) => ({ ...c })),
   allowSkills: false,
   allowWeb: false,
+  glossaryModel: "sonnet",
 };
 
 /**
@@ -142,6 +148,9 @@ export default class AugmentedPdfPlugin extends Plugin {
   /** Full ids of the per-category smart-paste commands currently registered, so we can remove the
    *  stale ones when categories are added/removed/renamed in settings (re-registration). */
   private smartPasteCommandIds: string[] = [];
+
+  /** The in-flight glossary build, so it can be cancelled and concurrent builds prevented. */
+  private activeGlossaryBuild: { cancel: () => void; pdf: string } | null = null;
 
   onunload(): void {
     for (const c of this.liveChildren) {
@@ -251,6 +260,42 @@ export default class AugmentedPdfPlugin extends Plugin {
       id: "preflight",
       name: "Preflight (PDF++ + claude auth)",
       callback: () => void this.preflight(),
+    });
+
+    this.addCommand({
+      id: "glossary-lookup",
+      name: "Glossary: look up a term",
+      checkCallback: (checking: boolean) => {
+        const f = this.app.workspace.getActiveFile();
+        if (f && f.extension === "pdf") {
+          if (!checking) void this.openGlossaryLookup(f);
+          return true;
+        }
+        return false;
+      },
+    });
+    this.addCommand({
+      id: "glossary-build",
+      name: "Glossary: build / refresh for this PDF",
+      checkCallback: (checking: boolean) => {
+        const f = this.app.workspace.getActiveFile();
+        if (f && f.extension === "pdf") {
+          if (!checking) void this.runGlossaryBuild(f);
+          return true;
+        }
+        return false;
+      },
+    });
+    this.addCommand({
+      id: "glossary-cancel-build",
+      name: "Glossary: cancel running build",
+      checkCallback: (checking: boolean) => {
+        if (this.activeGlossaryBuild) {
+          if (!checking) this.activeGlossaryBuild.cancel();
+          return true;
+        }
+        return false;
+      },
     });
 
     // Smart paste: one bindable command per color category. Re-registerable so settings edits
@@ -402,6 +447,72 @@ export default class AugmentedPdfPlugin extends Plugin {
     view.startGeneralChat();
   }
 
+  /** Open the glossary lookup modal for a PDF (the modal offers to build if none exists yet). */
+  async openGlossaryLookup(pdf: TFile): Promise<void> {
+    new GlossaryLookupModal(this.app, this, pdf).open();
+  }
+
+  /** Build (or refresh) a PDF's glossary in the background, with a live, cancellable progress notice. */
+  async runGlossaryBuild(pdf: TFile): Promise<void> {
+    if (this.activeGlossaryBuild) {
+      new Notice("A glossary build is already running — cancel it first or wait for it to finish.");
+      return;
+    }
+    const existed = !!(await readGlossary(this.app, pdf.path, pdf.name));
+    const verb = existed ? "Refreshing" : "Building";
+    const started = Date.now();
+    let last: { phase: string; terms: number; costUsd: number } = { phase: "starting", terms: 0, costUsd: 0 };
+    const elapsed = () => {
+      const s = Math.floor((Date.now() - started) / 1000);
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    };
+    const line = () =>
+      `${verb} glossary “${pdf.basename}” · ${last.phase}` +
+      `${last.terms ? ` · ~${last.terms} terms` : ""}${last.costUsd ? ` · ~$${last.costUsd.toFixed(2)}` : ""} · ${elapsed()} elapsed`;
+    // A persistent notice AND a status-bar item, both ticking every second — so the build's liveness is
+    // visible even during the multi-minute read/think phase that streams no text.
+    const notice = new Notice(line(), 0);
+    const statusEl = this.addStatusBarItem();
+    const paint = () => {
+      notice.setMessage(line());
+      statusEl.setText(`⏳ Glossary ${elapsed()}`);
+    };
+    paint();
+    const tick = window.setInterval(paint, 1000);
+    this.registerInterval(tick);
+    const build = startGlossaryBuild(this, pdf.path, pdf.name, (u) => {
+      last = u;
+      paint();
+    });
+    this.activeGlossaryBuild = { cancel: build.cancel, pdf: pdf.path };
+    try {
+      const res = await build.promise;
+      window.clearInterval(tick);
+      notice.hide();
+      statusEl.remove();
+      const resumeHint = res.count ? ` Saved ${res.count} terms — run “Glossary: build / refresh” to resume.` : "";
+      if (res.error === "cancelled") {
+        new Notice(`Glossary build cancelled.${resumeHint}`, 8000);
+      } else if (res.error) {
+        // Persistent (timeout 0) so the cause can't flash by unseen; also logged for the console.
+        new Notice(`⚠️ Glossary build error: ${res.error}.${resumeHint}`, 0);
+        console.error("[augmented-pdf] glossary build error:", res.error);
+      } else {
+        const cost = res.costUsd ? ` (~$${res.costUsd.toFixed(2)})` : "";
+        new Notice(`✓ Glossary ${existed ? "refreshed" : "built"}: ${res.count} term${res.count === 1 ? "" : "s"}${cost}.`, 12000);
+      }
+    } catch (e) {
+      window.clearInterval(tick);
+      notice.hide();
+      statusEl.remove();
+      const msg = e instanceof Error ? e.message : String(e);
+      new Notice(`⚠️ Glossary build crashed: ${msg} (see console).`, 0); // persistent
+      console.error("[augmented-pdf] glossary build crashed", e);
+    } finally {
+      this.activeGlossaryBuild = null;
+    }
+  }
+
   /** Rename/move the sibling (annotations)/(chats) folders when a PDF is renamed or moved. */
   private async onPdfRenamed(file: TAbstractFile, oldPath: string): Promise<void> {
     if (!(file instanceof TFile) || file.extension !== "pdf") return;
@@ -422,6 +533,21 @@ export default class AugmentedPdfPlugin extends Plugin {
           console.error("[augmented-pdf] folder rename failed", oldFolderPath, "->", newFolderPath, e);
           new Notice(`Augmented PDF: couldn't rename "${suffix}" folder for the renamed PDF (see console).`, 8000);
         }
+      }
+    }
+
+    // The glossary is a FILE (not a folder), so it needs its own rename + frontmatter backlink fix —
+    // adding "(glossary)" to the folder loop above would silently no-op (that loop checks TFolder).
+    const oldGloss = (oldDir ? oldDir + "/" : "") + `${oldStem} (glossary).md`;
+    const gf = this.app.vault.getAbstractFileByPath(oldGloss);
+    if (gf instanceof TFile) {
+      const newGloss = (newDir ? newDir + "/" : "") + `${newStem} (glossary).md`;
+      try {
+        await this.app.fileManager.renameFile(gf, newGloss);
+        await this.app.vault.process(gf, (c) => c.replace(/^pdf: .*$/m, `pdf: "[[${file.name}]]"`));
+      } catch (e) {
+        console.error("[augmented-pdf] glossary rename failed", oldGloss, "->", newGloss, e);
+        new Notice("Augmented PDF: couldn't rename the glossary note for the renamed PDF (see console).", 8000);
       }
     }
   }
@@ -810,6 +936,26 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
             if (leaf.view instanceof ChatView) leaf.view.applyWebDefault(v);
           }
         })
+      );
+
+    containerEl.createEl("h3", { text: "Glossary" });
+    new Setting(containerEl)
+      .setName("Glossary model")
+      .setDesc(
+        "Model used to build a paper's glossary — Claude reads the PDF and extracts terms with definitions. " +
+          "Sonnet gives better definitions on dense papers (≈ $0.45–0.90 and several minutes per paper); Haiku " +
+          "is cheaper and faster but occasionally shallower. Builds run in the background; look terms up with the " +
+          "“Glossary: look up a term” command (bind a hotkey)."
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("sonnet", "sonnet")
+          .addOption("haiku", "haiku")
+          .setValue(this.plugin.settings.glossaryModel || "sonnet")
+          .onChange(async (v) => {
+            this.plugin.settings.glossaryModel = v;
+            await this.plugin.saveSettings();
+          })
       );
 
     containerEl.createEl("h3", { text: "Smart paste" });

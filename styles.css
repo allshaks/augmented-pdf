@@ -107,6 +107,94 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 .apc-cat-row .apc-cat-color {
   width: 11em;
 }
+
+/* ---- Glossary lookup modal ---- */
+.apc-gloss-modal {
+  width: min(760px, 90vw);
+}
+.apc-gloss-src {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: var(--size-2-2);
+}
+.apc-gloss-input {
+  width: 100%;
+  margin-bottom: var(--size-4-2);
+}
+.apc-gloss-body {
+  display: flex;
+  gap: var(--size-4-2);
+  height: 50vh;
+  min-height: 280px;
+}
+.apc-gloss-list {
+  flex: 0 0 38%;
+  overflow-y: auto;
+  border-right: 1px solid var(--background-modifier-border);
+  padding-right: var(--size-2-3);
+}
+.apc-gloss-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) var(--size-2-2);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+.apc-gloss-row:hover {
+  background: var(--background-modifier-hover);
+}
+.apc-gloss-row.is-selected {
+  background: var(--background-modifier-active-hover, var(--background-secondary-alt));
+}
+.apc-gloss-row-term {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.apc-gloss-badge {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.apc-gloss-def {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding-left: var(--size-2-2);
+}
+.apc-gloss-def-term {
+  font-weight: var(--font-bold);
+  font-size: var(--font-ui-large);
+  margin-bottom: var(--size-2-1);
+}
+.apc-gloss-prov {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: var(--size-4-2);
+}
+.apc-gloss-empty,
+.apc-gloss-hint {
+  color: var(--text-muted);
+  margin-bottom: var(--size-2-3);
+}
+.apc-gloss-more {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-2-2);
+}
+.apc-gloss-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-2);
+  margin-top: var(--size-4-2);
+}
+.apc-gloss-editor {
+  width: 100%;
+  min-height: 7em;
+  resize: vertical;
+}
 .apc-skills-toggle {
   display: inline-flex;
   align-items: center;

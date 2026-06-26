@@ -19,6 +19,12 @@ export function chatsFolder(pdfPath: string, pdfName: string): string {
   return (d ? d + "/" : "") + `${stemOf(pdfName)} (chats)`;
 }
 
+/** Sibling glossary note for a PDF, e.g. "{dir}/{stem} (glossary).md". */
+export function glossaryPath(pdfPath: string, pdfName: string): string {
+  const d = dirOf(pdfPath);
+  return (d ? d + "/" : "") + `${stemOf(pdfName)} (glossary).md`;
+}
+
 /** Deterministic per-highlight key used as the hub filename prefix. Dots (not commas) for FS safety. */
 export function hubKey(page: number, selId: string): string {
   return `p${page}-s${selId.replace(/,/g, ".")}`;
