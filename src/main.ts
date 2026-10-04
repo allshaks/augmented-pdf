@@ -15,17 +15,28 @@ import {
 } from "obsidian";
 import { execFile } from "child_process";
 import { CHAT_VIEW_TYPE, ChatView } from "./chat/view";
-import { ChatContext, EFFORT_LEVELS } from "./types";
+import { ChatContext, EFFORT_LEVELS, MODEL_CHOICES, SelectionContext, SourceKind } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
+import { currentSelectionText } from "./activeSelection";
 import { findHub, findNearbyHubs } from "./store/hub";
 import { parseTranscriptTurns } from "./store/transcript";
-import { appendUnderHeading, chatsFolder, extractQuotePassage, oneLine, slugify, stemOf } from "./store/paths";
+import {
+  appendUnderHeading,
+  extractQuotePassage,
+  mdChatFolder,
+  oneLine,
+  slugify,
+  stemOf,
+  transcriptsFolder,
+} from "./store/paths";
 import { stripControlChars } from "./format";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { AllChatsModal, ChatPickerEntry } from "./modals/allChats";
 import { readGlossary } from "./store/glossary";
 import { startGlossaryBuild } from "./glossaryGen";
 import { GlossaryLookupModal } from "./modals/glossaryLookup";
+import { AiProvider, ClaudeCliProvider } from "./ai/provider";
+import { GwdgHttpProvider } from "./ai/gwdg";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
 /**
@@ -66,6 +77,25 @@ interface AugmentedPdfSettings {
   allowWeb: boolean;
   /** Model used to build per-PDF glossaries (Claude reads the PDF): "sonnet" (default) | "haiku". */
   glossaryModel: string;
+  /** Active AI backend: "claude" (CLI, default; full features) | "gwdg" (GWDG Chat AI, HTTP). */
+  aiProvider: "claude" | "gwdg";
+  /** GWDG Chat AI API key (Bearer). Stored locally; user-provided. */
+  gwdgApiKey: string;
+  /** OpenAI-compatible base URL for GWDG. */
+  gwdgBaseUrl: string;
+  /** GWDG model id used for chat/summaries. */
+  gwdgModel: string;
+  /**
+   * Vault folder collecting chats about markdown notes, as "<root>/<note's path>/<stem>/". PDFs keep
+   * their sibling "(annotations)"/"(chats)" folders; notes are gathered under one root instead so the
+   * user's own note tree stays free of generated sibling folders.
+   */
+  mdChatsRoot: string;
+  /**
+   * When true, adding a note selection to a chat drops a "💬 chat" link back to that chat next to the
+   * passage in the source note (written once the chat is first saved). Markdown sources only.
+   */
+  linkSelectionToChat: boolean;
 }
 
 const DEFAULT_SMART_CATEGORIES: SmartCategory[] = [
@@ -89,6 +119,12 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   allowSkills: false,
   allowWeb: false,
   glossaryModel: "sonnet",
+  aiProvider: "claude",
+  gwdgApiKey: "",
+  gwdgBaseUrl: "https://chat-ai.academiccloud.de/v1",
+  gwdgModel: "meta-llama-3.1-8b-instruct",
+  mdChatsRoot: "chats",
+  linkSelectionToChat: true,
 };
 
 /**
@@ -173,18 +209,35 @@ export default class AugmentedPdfPlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor("augmented-pdf-chat", (_src, el, ctx) => {
       const f = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
       if (!(f instanceof TFile)) return;
-      const type = this.app.metadataCache.getFileCache(f)?.frontmatter?.["augmented-pdf"];
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      const type = fm?.["augmented-pdf"];
       if (type === "transcript") {
         const btn = el.createEl("button", { cls: "mod-cta apc-hub-btn", text: "↻ Continue this chat in the sidebar" });
         btn.onclick = () => void this.openChatFromTranscript(f);
       } else {
-        const btn = el.createEl("button", { cls: "mod-cta apc-hub-btn", text: "💬 New chat about this highlight" });
-        btn.onclick = () => void this.openChatFromHub(f);
+        const actions = el.createDiv({ cls: "apc-hub-actions" });
+        const what =
+          fm?.scope !== "file" ? "this highlight" : fm?.kind === "md" ? "this note" : "this document";
+        const newBtn = actions.createEl("button", {
+          cls: "mod-cta apc-hub-btn",
+          text: `💬 New chat about ${what}`,
+        });
+        newBtn.onclick = () => void this.openChatFromHub(f);
+        // Existing chats for THIS anchor are otherwise stranded on the hub — surface a picker that
+        // opens one straight in the sidebar. Gated on chat-count so it only shows when there are chats.
+        const count = Number(fm?.["chat-count"] ?? 0);
+        if (count > 0) {
+          const openBtn = actions.createEl("button", {
+            cls: "apc-hub-btn apc-hub-open",
+            text: `📂 Open a saved chat (${count})  ▾`,
+          });
+          openBtn.onclick = (evt) => void this.showHubChatPicker(f, evt);
+        }
       }
     });
 
-    // Keep annotation/chat folders in sync when a PDF is renamed or moved.
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.onPdfRenamed(file, oldPath)));
+    // Keep annotation/chat folders in sync when a PDF or a note is renamed or moved.
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.onSourceRenamed(file, oldPath)));
 
     this.app.workspace.onLayoutReady(() => {
       this.wire();
@@ -192,11 +245,19 @@ export default class AugmentedPdfPlugin extends Plugin {
     });
 
     this.addCommand({
+      // Id kept from when this was selection-only, so existing hotkey bindings survive.
       id: "ask-claude-open-chat",
-      name: "Ask Claude about selection (open chat)",
+      name: "Ask Claude about this file or selection (open chat)",
       // Default Cmd/Ctrl+Esc — rebindable in Settings → Hotkeys.
       hotkeys: [{ modifiers: ["Mod"], key: "Escape" }],
-      callback: () => void this.openChatForSelection(),
+      callback: () => void this.newChatForActiveFile(),
+    });
+    this.addCommand({
+      // Invoked by hotkey, focus is still in the note/PDF, so the selection is always readable here.
+      id: "add-selection-to-chat",
+      name: "Add the current selection to the open chat (as a quote)",
+      hotkeys: [{ modifiers: ["Mod", "Shift"], key: "Escape" }],
+      callback: () => void this.addSelectionToChat(),
     });
     this.addCommand({
       id: "ask-claude-general-chat",
@@ -357,7 +418,7 @@ export default class AugmentedPdfPlugin extends Plugin {
           item
             .setTitle("Ask Claude about selection")
             .setIcon("bot")
-            .onClick(() => void this.openChatForSelection())
+            .onClick(() => void this.newChatForActiveFile())
         );
         menu.addItem((item) =>
           item
@@ -375,6 +436,11 @@ export default class AugmentedPdfPlugin extends Plugin {
     return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : process.cwd();
   }
 
+  /** The active AI backend — Claude CLI (default) or GWDG Chat AI. */
+  getProvider(): AiProvider {
+    return this.settings.aiProvider === "gwdg" ? new GwdgHttpProvider(this) : new ClaudeCliProvider(this);
+  }
+
   private async activateChatView(): Promise<ChatView | null> {
     const { workspace } = this.app;
     let leaf: WorkspaceLeaf | null = workspace.getLeavesOfType(CHAT_VIEW_TYPE)[0] ?? null;
@@ -387,23 +453,55 @@ export default class AugmentedPdfPlugin extends Plugin {
     return leaf.view instanceof ChatView ? leaf.view : null;
   }
 
-  private async openChatForSelection(): Promise<void> {
+  /**
+   * Start a chat about whatever is open. A PDF text selection anchors the chat to that highlight
+   * (the original behavior); with no selection — or in a markdown note — the chat is about the whole
+   * file. Nothing open at all falls back to a context-free chat.
+   */
+  async newChatForActiveFile(preselected?: string): Promise<void> {
     const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      await this.openGeneralChat();
+      return;
+    }
+    if (file.extension === "pdf") {
+      await this.openChatForPdf(file, preselected);
+      return;
+    }
+    if (file.extension === "md") {
+      await this.openChatForNote(file, preselected);
+      return;
+    }
+    new Notice(`Chats work on PDFs and notes — "${file.name}" is neither.`);
+  }
+
+  /** PDF: anchor to the selected highlight if there is one, else chat about the whole document. */
+  private async openChatForPdf(file: TFile, preselected?: string): Promise<void> {
     const info = getSelectionInfo(this.app);
     // PDF text extraction can yield NUL/control bytes; strip them so they never reach the prompt
     // (which would crash spawn) or the saved notes.
-    const text = stripControlChars(getSelectedText(this.app));
-    if (!file || file.extension !== "pdf") {
-      new Notice("Open a PDF and select some text first.");
+    const text = (preselected ?? stripControlChars(getSelectedText(this.app))).trim();
+
+    if (!info || !text) {
+      // Anchoring needs `info` (the live page+selection key), which a click into the sidebar can
+      // collapse. The TEXT may still have survived as a mousedown snapshot — keep it as the chat's
+      // focus rather than dropping it, even though this chat is scoped to the whole document.
+      await this.startChat({
+        scope: "file",
+        kind: "pdf",
+        fileName: file.name,
+        filePath: file.path,
+        passage: text || undefined,
+        litNote: this.findLitNote(file.path, file.name),
+      });
       return;
     }
-    if (!info) {
-      new Notice("No PDF selection detected (select text, then try again).");
-      return;
-    }
-    const ctx: ChatContext = {
-      pdfName: file.name,
-      pdfPath: file.path,
+
+    const ctx: SelectionContext = {
+      scope: "selection",
+      kind: "pdf",
+      fileName: file.name,
+      filePath: file.path,
       page: info.page,
       selId: info.selId,
       color: cssColorToRgbParam(this.settings.defaultColor),
@@ -413,8 +511,8 @@ export default class AugmentedPdfPlugin extends Plugin {
 
     // If this selection overlaps an existing highlight (but isn't identical), offer to fold the
     // chat into that highlight's accumulating annotation rather than create a near-duplicate.
-    if (!findHub(this.app, ctx)) {
-      const nearby = findNearbyHubs(this.app, ctx);
+    if (!findHub(this.app, ctx, this.settings.mdChatsRoot)) {
+      const nearby = findNearbyHubs(this.app, ctx, this.settings.mdChatsRoot);
       if (nearby.length) {
         const choice = await new Promise<NearbyChoice>((resolve) =>
           new NearbyHighlightModal(this.app, nearby[0], resolve).open()
@@ -428,7 +526,71 @@ export default class AugmentedPdfPlugin extends Plugin {
         }
       }
     }
+    await this.startChat(ctx);
+  }
 
+  /** Markdown: chat about the whole note (any selection rides along as context, not as an anchor). */
+  private async openChatForNote(file: TFile, preselected?: string): Promise<void> {
+    // Our own generated notes aren't chat subjects — "New chat" from one means what its button means.
+    const type = this.app.metadataCache.getFileCache(file)?.frontmatter?.["augmented-pdf"];
+    if (type === "hub") {
+      await this.openChatFromHub(file);
+      return;
+    }
+    if (type === "transcript") {
+      await this.openChatFromTranscript(file);
+      return;
+    }
+    const passage = (preselected ?? this.currentSelectionText()).trim();
+    await this.startChat({
+      scope: "file",
+      kind: "md",
+      fileName: file.name,
+      filePath: file.path,
+      passage: passage || undefined,
+    });
+  }
+
+  /** Text selected in the open PDF or note, or "". See activeSelection.ts for why it works this way. */
+  currentSelectionText(): string {
+    return currentSelectionText(this.app);
+  }
+
+  /** Send whatever is selected in the open note/PDF into the chat as a quote. */
+  async addSelectionToChat(preselected?: string): Promise<void> {
+    const text = (preselected ?? this.currentSelectionText()).trim();
+    if (!text) {
+      new Notice("Select some text in a note or PDF first, then add it to the chat.");
+      return;
+    }
+    const view = await this.activateChatView();
+    if (!view) {
+      new Notice("Couldn't open the chat panel.");
+      return;
+    }
+
+    // A quote on its own is useless: without a context the chat is a GENERAL one, so the model gets
+    // the passage and nothing of the document it came from — all it can say is "tell me the context".
+    // So make sure the chat is scoped to the file the selection came from.
+    if (!view.hasContext()) {
+      if (view.isPristine()) {
+        // Nothing said yet → just start the chat on this file, with the selection as its focus.
+        await this.newChatForActiveFile(text);
+        return;
+      }
+      // A general chat already underway: re-scoping would discard it (general chats are never saved
+      // to a note), so keep the thread and attach the source file as context instead.
+      const f = this.app.workspace.getActiveFile();
+      if (f && (f.extension === "md" || f.extension === "pdf")) view.attachFile(f.path);
+    }
+    view.insertQuote(text);
+    // Link the source note back to this chat, next to the passage. (New-chat-from-selection is
+    // handled in setContext; this covers adding a selection to an already-running chat.)
+    const src = this.app.workspace.getActiveFile();
+    if (src?.extension === "md") view.queueBacklink(src.path, text);
+  }
+
+  private async startChat(ctx: ChatContext): Promise<void> {
     const view = await this.activateChatView();
     if (!view) {
       new Notice("Couldn't open the chat panel.");
@@ -514,8 +676,10 @@ export default class AugmentedPdfPlugin extends Plugin {
   }
 
   /** Rename/move the sibling (annotations)/(chats) folders when a PDF is renamed or moved. */
-  private async onPdfRenamed(file: TAbstractFile, oldPath: string): Promise<void> {
-    if (!(file instanceof TFile) || file.extension !== "pdf") return;
+  private async onSourceRenamed(file: TAbstractFile, oldPath: string): Promise<void> {
+    if (!(file instanceof TFile)) return;
+    if (file.extension === "md") return this.onNoteRenamed(file, oldPath);
+    if (file.extension !== "pdf") return;
     const oldStem = oldPath.replace(/^.*\//, "").replace(/\.pdf$/i, "");
     const oldDir = oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "";
     const newStem = file.basename;
@@ -548,6 +712,54 @@ export default class AugmentedPdfPlugin extends Plugin {
       } catch (e) {
         console.error("[augmented-pdf] glossary rename failed", oldGloss, "->", newGloss, e);
         new Notice("Augmented PDF: couldn't rename the glossary note for the renamed PDF (see console).", 8000);
+      }
+    }
+  }
+
+  /**
+   * Keep a note's chat folder in step when the note is renamed or moved. The folder path mirrors the
+   * note's path, so without this the chats (and their accumulated summaries) would be orphaned: the
+   * next chat would silently start a second folder under the new path.
+   */
+  private async onNoteRenamed(file: TFile, oldPath: string): Promise<void> {
+    const root = this.settings.mdChatsRoot;
+    const oldFolderPath = mdChatFolder(oldPath, root);
+    const newFolderPath = mdChatFolder(file.path, root);
+    if (oldFolderPath === newFolderPath) return;
+    // Renaming one of our OWN notes (a hub/transcript living under the root) must not cascade.
+    if (oldPath.startsWith(root.replace(/^\/+|\/+$/g, "") + "/")) return;
+    const folder = this.app.vault.getAbstractFileByPath(oldFolderPath);
+    if (!(folder instanceof TFolder)) return;
+    try {
+      await this.ensureParentFolder(newFolderPath);
+      await this.app.fileManager.renameFile(folder, newFolderPath);
+      // The stored path is authoritative for finding a note's chats, so it has to follow the note.
+      // (Obsidian rewrites the `source:` wikilink itself, but never a plain string field.)
+      for (const child of folder.children) {
+        if (child instanceof TFile && child.extension === "md") {
+          await this.app.vault.process(child, (c) =>
+            c.replace(/^source-path: .*$/m, `source-path: ${JSON.stringify(file.path)}`)
+          );
+        }
+      }
+    } catch (e) {
+      console.error("[augmented-pdf] note chat-folder rename failed", oldFolderPath, "->", newFolderPath, e);
+      new Notice("Augmented PDF: couldn't move the chats folder for the renamed note (see console).", 8000);
+    }
+  }
+
+  /** Create everything above `path` so a rename into a fresh subtree doesn't fail. */
+  private async ensureParentFolder(path: string): Promise<void> {
+    const parent = path.slice(0, path.lastIndexOf("/"));
+    if (!parent) return;
+    let cur = "";
+    for (const seg of parent.split("/").filter(Boolean)) {
+      cur = cur ? `${cur}/${seg}` : seg;
+      if (this.app.vault.getAbstractFileByPath(cur)) continue;
+      try {
+        await this.app.vault.createFolder(cur);
+      } catch {
+        /* exists or race — fine */
       }
     }
   }
@@ -634,54 +846,100 @@ export default class AugmentedPdfPlugin extends Plugin {
     return this.app.metadataCache.getFileCache(file)?.frontmatter?.["augmented-pdf"] === "hub";
   }
 
-  /** Re-open a chat for an existing highlight straight from its hub note (no PDF re-selection). */
+  /**
+   * Rebuild a ChatContext from a hub/transcript's frontmatter.
+   *
+   * Tolerates legacy notes, which predate `scope`/`source`/`kind` and are always PDF selections: an
+   * absent `scope` means "selection", and `pdf:` stands in for `source:`. `source-path` is preferred
+   * over the wikilink because note basenames are not unique in this vault.
+   */
+  private ctxFromFrontmatter(
+    fm: Record<string, unknown>,
+    notePath: string,
+    passage: string
+  ): ChatContext | null {
+    const linkPath = (v: unknown) =>
+      String(v ?? "")
+        .replace(/^\[\[|\]\]$/g, "")
+        .split("|")[0]
+        .trim();
+    const srcPath = typeof fm["source-path"] === "string" ? fm["source-path"] : "";
+    const srcLink = linkPath(fm.source) || linkPath(fm.pdf);
+
+    let file: TFile | null = null;
+    if (srcPath) {
+      const f = this.app.vault.getAbstractFileByPath(srcPath);
+      if (f instanceof TFile) file = f;
+    }
+    if (!file && srcLink) {
+      const f = this.app.metadataCache.getFirstLinkpathDest(srcLink, notePath);
+      if (f instanceof TFile) file = f;
+    }
+    const filePath = file?.path || srcPath || srcLink;
+    const fileName = file?.name || filePath.split("/").pop() || "";
+    if (!filePath || !fileName) return null;
+
+    const kind: SourceKind =
+      fm.kind === "md" || fm.kind === "pdf" ? fm.kind : /\.pdf$/i.test(fileName) ? "pdf" : "md";
+    const litNote = kind === "pdf" ? this.findLitNote(filePath, fileName) : undefined;
+    const attachments = Array.isArray(fm.context) ? fm.context.map(String) : undefined;
+
+    if (fm.scope !== "file") {
+      const page = Number(fm.page);
+      const selId = String(fm.selection ?? "");
+      if (kind !== "pdf" || !page || !selId) return null;
+      return {
+        scope: "selection",
+        kind: "pdf",
+        fileName,
+        filePath,
+        page,
+        selId,
+        color: String(fm.color ?? this.settings.defaultColor),
+        passage,
+        litNote,
+        attachments,
+      };
+    }
+    return { scope: "file", kind, fileName, filePath, passage: passage || undefined, litNote, attachments };
+  }
+
+  /** Start a fresh chat on an existing hub's anchor, straight from the hub note. */
   async openChatFromHub(hubFile: TFile): Promise<void> {
     const fm = this.app.metadataCache.getFileCache(hubFile)?.frontmatter;
     if (!fm || fm["augmented-pdf"] !== "hub") {
       new Notice("This isn't an Augmented PDF annotation note.");
       return;
     }
-    const pdfName = String(fm.pdf ?? "").replace(/^\[\[|\]\]$/g, "").trim();
-    const page = Number(fm.page);
-    const selId = String(fm.selection ?? "");
-    const color = String(fm.color ?? this.settings.defaultColor);
+    // A selection hub's passage IS its anchor, so it must be recovered; a file hub has no quote.
     let passage = typeof fm.passage === "string" ? fm.passage : "";
-    if (!passage) passage = extractQuotePassage(await this.app.vault.cachedRead(hubFile));
-    if (!pdfName || !selId || !page) {
-      new Notice("Annotation note is missing pdf/page/selection metadata.");
+    if (!passage && fm.scope !== "file") passage = extractQuotePassage(await this.app.vault.cachedRead(hubFile));
+    const ctx = this.ctxFromFrontmatter(fm, hubFile.path, passage);
+    if (!ctx) {
+      new Notice("Annotation note is missing the metadata needed to reopen it (source/page/selection).");
       return;
     }
-    const pdf = this.app.metadataCache.getFirstLinkpathDest(pdfName, hubFile.path);
-    const pdfPath = pdf?.path ?? pdfName;
-    const ctx: ChatContext = {
-      pdfName,
-      pdfPath,
-      page,
-      selId,
-      color,
-      passage,
-      litNote: this.findLitNote(pdfPath, pdfName),
-    };
-    const view = await this.activateChatView();
-    if (!view) {
-      new Notice("Couldn't open the chat panel.");
-      return;
-    }
-    view.setContext(ctx);
+    await this.startChat(ctx);
   }
 
-  /** All saved chat transcripts for a paper (newest first) — powers the in-panel chat picker. */
-  async listPaperChats(
-    pdfPath: string,
-    pdfName: string
+  /** All saved chats stored alongside this context's file (newest first) — the in-panel picker. */
+  async listFileChats(ctx: ChatContext): Promise<{ file: TFile; label: string; created: number }[]> {
+    return this.listChatsIn(transcriptsFolder(ctx, this.settings.mdChatsRoot));
+  }
+
+  /** Transcript entries in one folder, newest first. */
+  private async listChatsIn(
+    folderPath: string,
+    keep?: (fm: Record<string, unknown>) => boolean
   ): Promise<{ file: TFile; label: string; created: number }[]> {
-    const folder = this.app.vault.getAbstractFileByPath(chatsFolder(pdfPath, pdfName));
+    const folder = this.app.vault.getAbstractFileByPath(folderPath);
     if (!(folder instanceof TFolder)) return [];
     const out: { file: TFile; label: string; created: number }[] = [];
     for (const child of folder.children) {
       if (!(child instanceof TFile) || child.extension !== "md") continue;
       const fm = this.app.metadataCache.getFileCache(child)?.frontmatter;
       if (!fm || fm["augmented-pdf"] !== "transcript") continue;
+      if (keep && !keep(fm)) continue;
       const createdMs = fm.created ? Date.parse(String(fm.created)) : child.stat.ctime;
       // Label = the opening question; fall back to the summary, then the filename.
       let label = "";
@@ -698,6 +956,41 @@ export default class AugmentedPdfPlugin extends Plugin {
     return out;
   }
 
+  /** Saved chats for ONE hub's anchor, newest first — powers the hub's "Open a chat" picker. */
+  async listHubChats(hubFile: TFile): Promise<{ file: TFile; label: string; created: number }[]> {
+    const hfm = this.app.metadataCache.getFileCache(hubFile)?.frontmatter;
+    if (!hfm || hfm["augmented-pdf"] !== "hub") return [];
+    const ctx = this.ctxFromFrontmatter(hfm, hubFile.path, String(hfm.passage ?? ""));
+    if (!ctx) return [];
+    return this.listChatsIn(transcriptsFolder(ctx, this.settings.mdChatsRoot), (fm) => {
+      // A PDF's "(chats)" folder holds every chat on that paper, so the transcript's anchor has to
+      // match this hub's — same scope, and for a selection hub the same page + selection. (Legacy
+      // transcripts have no `scope`; like legacy hubs they're selections.)
+      const scope = fm.scope === "file" ? "file" : "selection";
+      if (scope !== ctx.scope) return false;
+      if (ctx.scope !== "selection") return true;
+      return Number(fm.page) === ctx.page && String(fm.selection ?? "") === ctx.selId;
+    });
+  }
+
+  /** Popup menu of a hub's saved chats; selecting one opens it in the sidebar. */
+  async showHubChatPicker(hubFile: TFile, evt: MouseEvent): Promise<void> {
+    const entries = await this.listHubChats(hubFile);
+    if (!entries.length) {
+      new Notice("No saved chats here yet.");
+      return;
+    }
+    const menu = new Menu();
+    for (const e of entries) {
+      menu.addItem((item) => {
+        item.setTitle(e.label);
+        item.setIcon("message-square");
+        item.onClick(() => void this.openChatFromTranscript(e.file));
+      });
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
   /**
    * Every saved chat transcript across the whole vault (newest first) — powers the global picker
    * reachable from the empty/default panel. Frontmatter (`augmented-pdf: transcript`) is read from
@@ -709,9 +1002,12 @@ export default class AugmentedPdfPlugin extends Plugin {
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
       if (!fm || fm["augmented-pdf"] !== "transcript") continue;
       const createdMs = fm.created ? Date.parse(String(fm.created)) : file.stat.ctime;
-      const pdfRaw = String(fm.pdf ?? "").replace(/^\[\[|\]\]$/g, "").trim();
-      const paper = pdfRaw ? stemOf(pdfRaw) : "";
-      // Label = the opening question; fall back to the summary, then the filename (mirrors listPaperChats).
+      const srcRaw = String(fm.source ?? fm.pdf ?? "")
+        .replace(/^\[\[|\]\]$/g, "")
+        .split("|")[0]
+        .trim();
+      const paper = srcRaw ? stemOf(srcRaw.split("/").pop() || srcRaw) : "";
+      // Label = the opening question; fall back to the summary, then the filename (mirrors listFileChats).
       let label = "";
       try {
         const m = (await this.app.vault.cachedRead(file)).match(/^##\s+You\s*\n([^\n]+)/m);
@@ -745,27 +1041,19 @@ export default class AugmentedPdfPlugin extends Plugin {
     }
     const link = (v: unknown) => String(v ?? "").replace(/^\[\[|\]\]$/g, "").trim();
     const content = await this.app.vault.cachedRead(file);
-    const pdfName = link(fm.pdf);
-    const page = Number(fm.page);
-    const selId = String(fm.selection ?? "");
     const sessionId = String(fm["session-id"] ?? "");
-    if (!pdfName || !selId || !page || !sessionId) {
-      new Notice("Transcript is missing pdf/page/selection/session metadata.");
+    if (!sessionId) {
+      new Notice("Transcript is missing its session id.");
       return;
     }
-    const pdf = this.app.metadataCache.getFirstLinkpathDest(pdfName, file.path);
-    const pdfPath = pdf?.path ?? pdfName;
+    const ctx = this.ctxFromFrontmatter(fm, file.path, extractQuotePassage(content));
+    if (!ctx) {
+      new Notice("Transcript is missing the metadata needed to reopen it (source/page/selection).");
+      return;
+    }
+    if (!ctx.litNote && fm["lit-note"]) ctx.litNote = link(fm["lit-note"]);
     const hubName = link(fm.hub);
     const hub = hubName ? this.app.metadataCache.getFirstLinkpathDest(hubName, file.path) : null;
-    const ctx: ChatContext = {
-      pdfName,
-      pdfPath,
-      page,
-      selId,
-      color: String(fm.color ?? this.settings.defaultColor),
-      passage: extractQuotePassage(content),
-      litNote: this.findLitNote(pdfPath, pdfName) ?? (fm["lit-note"] ? link(fm["lit-note"]) : undefined),
-    };
     const view = await this.activateChatView();
     if (!view) {
       new Notice("Couldn't open the chat panel.");
@@ -777,6 +1065,7 @@ export default class AugmentedPdfPlugin extends Plugin {
       turns: parseTranscriptTurns(content),
       totalCost: Number(fm.cost_usd ?? 0),
       model: typeof fm.model === "string" ? fm.model : this.settings.model,
+      resolvedModel: typeof fm["model-id"] === "string" ? fm["model-id"] : null,
       hubFile: hub instanceof TFile ? hub : null,
       transcriptFile: file,
       createdISO: String(fm.created ?? "") || new Date().toISOString(),
@@ -868,7 +1157,7 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
       .setDesc("Default for new chats (changeable per chat in the panel).")
       .addDropdown((d) =>
         d
-          .addOptions({ haiku: "haiku", sonnet: "sonnet", opus: "opus" })
+          .addOptions(Object.fromEntries(MODEL_CHOICES.map((m) => [m, m])))
           .setValue(this.plugin.settings.model)
           .onChange(async (v) => {
             this.plugin.settings.model = v;
@@ -938,24 +1227,140 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
         })
       );
 
+    containerEl.createEl("h3", { text: "Chats about notes" });
+    new Setting(containerEl)
+      .setName("Note chats folder")
+      .setDesc(
+        "Vault folder collecting chats about markdown notes, one folder per note, mirroring the note's " +
+          "path (e.g. “chats/wiki/concepts/epsilon-machine”). The path is mirrored rather than flattened " +
+          "because note names aren't unique — two notes sharing a name would otherwise share a folder and " +
+          "merge their summaries. PDFs are unaffected: their chats stay beside the PDF. Changing this does " +
+          "NOT move existing chats."
+      )
+      .addText((t) =>
+        t
+          .setPlaceholder("chats")
+          .setValue(this.plugin.settings.mdChatsRoot)
+          .onChange(async (v) => {
+            // Empty would scatter chat folders across the vault root; fall back to the default.
+            this.plugin.settings.mdChatsRoot = v.trim().replace(/^\/+|\/+$/g, "") || "chats";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Link passages back to their chat")
+      .setDesc(
+        "When you add a selection from a note to a chat, drop a “💬 chat” link next to that passage " +
+          "in the note, pointing to the conversation (added once the chat is first saved). The link is " +
+          "placed at the end of the passage’s line, so it never alters the passage itself. Notes only — " +
+          "PDFs can’t be edited."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.linkSelectionToChat).onChange(async (v) => {
+          this.plugin.settings.linkSelectionToChat = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
     containerEl.createEl("h3", { text: "Glossary" });
     new Setting(containerEl)
       .setName("Glossary model")
       .setDesc(
         "Model used to build a paper's glossary — Claude reads the PDF and extracts terms with definitions. " +
-          "Sonnet gives better definitions on dense papers (≈ $0.45–0.90 and several minutes per paper); Haiku " +
-          "is cheaper and faster but occasionally shallower. Builds run in the background; look terms up with the " +
+          "Sonnet is the tested default: better definitions on dense papers (≈ $0.45–0.90 and several minutes " +
+          "per paper). Haiku is cheaper and faster but occasionally shallower; the higher tiers cost more and " +
+          "are untested for whole-paper extraction. Builds run in the background; look terms up with the " +
           "“Glossary: look up a term” command (bind a hotkey)."
       )
       .addDropdown((d) =>
         d
-          .addOption("sonnet", "sonnet")
-          .addOption("haiku", "haiku")
+          .addOptions(Object.fromEntries(MODEL_CHOICES.map((m) => [m, m])))
           .setValue(this.plugin.settings.glossaryModel || "sonnet")
           .onChange(async (v) => {
             this.plugin.settings.glossaryModel = v;
             await this.plugin.saveSettings();
           })
+      );
+
+    containerEl.createEl("h3", { text: "AI provider" });
+    new Setting(containerEl)
+      .setName("Provider")
+      .setDesc(
+        "Claude CLI (default) — full features: chat, glossary, vault skills, web. GWDG Chat AI (HTTP) — " +
+          "chat & summaries via your GWDG academic account; vault skills, web, and (for now) the glossary " +
+          "stay Claude-CLI-only. Takes effect on the next message / reopened chat panel."
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("claude", "Claude CLI")
+          .addOption("gwdg", "GWDG Chat AI")
+          .setValue(this.plugin.settings.aiProvider)
+          .onChange(async (v) => {
+            this.plugin.settings.aiProvider = v === "gwdg" ? "gwdg" : "claude";
+            await this.plugin.saveSettings();
+            this.display();
+          })
+      );
+    new Setting(containerEl)
+      .setName("GWDG API key")
+      .setDesc("Bearer token from the KISSKI booking form. Stored locally in this vault's plugin data — never share it.")
+      .addText((t) => {
+        t.setPlaceholder("paste your key")
+          .setValue(this.plugin.settings.gwdgApiKey)
+          .onChange(async (v) => {
+            this.plugin.settings.gwdgApiKey = v.trim();
+            await this.plugin.saveSettings();
+          });
+        t.inputEl.type = "password";
+        t.inputEl.style.width = "22em";
+      });
+    new Setting(containerEl)
+      .setName("GWDG base URL")
+      .setDesc("OpenAI-compatible endpoint base.")
+      .addText((t) =>
+        t
+          .setPlaceholder("https://chat-ai.academiccloud.de/v1")
+          .setValue(this.plugin.settings.gwdgBaseUrl)
+          .onChange(async (v) => {
+            this.plugin.settings.gwdgBaseUrl = v.trim() || "https://chat-ai.academiccloud.de/v1";
+            await this.plugin.saveSettings();
+          })
+      );
+    new Setting(containerEl)
+      .setName("GWDG model")
+      .setDesc(
+        "API model id (e.g. meta-llama-3.1-8b-instruct). For data residency pick a GWDG-hosted OPEN model " +
+          "(Claude/GPT via GWDG are proxied to the vendor). “Fetch models” populates autocomplete from your account."
+      )
+      .addText((t) => {
+        t.setPlaceholder("meta-llama-3.1-8b-instruct")
+          .setValue(this.plugin.settings.gwdgModel)
+          .onChange(async (v) => {
+            this.plugin.settings.gwdgModel = v.trim();
+            await this.plugin.saveSettings();
+          });
+        t.inputEl.setAttr("list", "apc-gwdg-models");
+      })
+      .addButton((b) =>
+        b.setButtonText("Fetch models").onClick(async () => {
+          b.setDisabled(true).setButtonText("Fetching…");
+          try {
+            const ids = await new GwdgHttpProvider(this.plugin).fetchModels();
+            let dl = containerEl.querySelector("datalist#apc-gwdg-models") as HTMLDataListElement | null;
+            if (!dl) {
+              dl = containerEl.createEl("datalist");
+              dl.id = "apc-gwdg-models";
+            }
+            dl.empty();
+            ids.forEach((id) => dl!.createEl("option", { value: id }));
+            new Notice(`Fetched ${ids.length} GWDG models — type in the model field to autocomplete.`);
+          } catch (e) {
+            new Notice("Couldn't fetch models: " + (e instanceof Error ? e.message : String(e)), 8000);
+          } finally {
+            b.setDisabled(false).setButtonText("Fetch models");
+          }
+        })
       );
 
     containerEl.createEl("h3", { text: "Smart paste" });

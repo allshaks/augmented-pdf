@@ -1,6 +1,6 @@
 import { App, TFile, TFolder, moment } from "obsidian";
-import { ChatContext } from "../types";
-import { annotationsFolder, ensureFolder, hubKey, oneLine, slugify, stemOf } from "./paths";
+import { ChatContext, SelectionContext } from "../types";
+import { ensureFolder, hubKey, hubKeyFor, hubsFolder, oneLine, slugify, stemOf } from "./paths";
 import { overlaps, parseSelId } from "./selection";
 
 export interface NearbyHub {
@@ -13,8 +13,8 @@ export interface NearbyHub {
 }
 
 /** Hubs on the same page whose selection overlaps (but isn't identical to) the given selection. */
-export function findNearbyHubs(app: App, ctx: ChatContext): NearbyHub[] {
-  const folder = app.vault.getAbstractFileByPath(annotationsFolder(ctx.pdfPath, ctx.pdfName));
+export function findNearbyHubs(app: App, ctx: SelectionContext, mdRoot: string): NearbyHub[] {
+  const folder = app.vault.getAbstractFileByPath(hubsFolder(ctx, mdRoot));
   if (!(folder instanceof TFolder)) return [];
   const target = parseSelId(ctx.selId);
   if (!target) return [];
@@ -40,17 +40,18 @@ export function findNearbyHubs(app: App, ctx: ChatContext): NearbyHub[] {
 }
 
 /**
- * The "hub" annotation note — one per highlight (keyed by page + selId). It holds the single
- * PDF++ selection link (the highlight) plus an append-only "## Chats" list, one entry per chat,
- * each = { summary, link to transcript }. Only this file is ever mutated; appends never touch
- * earlier entries.
+ * The "hub" annotation note — the accumulating index for one anchor. For a PDF highlight the anchor
+ * is (page, selId), so there's one hub per highlight; for a whole-file chat the anchor is the file
+ * itself, so there's exactly one hub per file. Either way it holds an append-only "## Chats" list,
+ * one entry per chat = { summary, link to transcript }. Only this file is ever mutated; appends
+ * never touch earlier entries.
  */
 
-/** Find an existing hub for this highlight, without creating one. */
-export function findHub(app: App, ctx: ChatContext): TFile | null {
-  const folder = app.vault.getAbstractFileByPath(annotationsFolder(ctx.pdfPath, ctx.pdfName));
+/** Find an existing hub for this context, without creating one. */
+export function findHub(app: App, ctx: ChatContext, mdRoot: string): TFile | null {
+  const folder = app.vault.getAbstractFileByPath(hubsFolder(ctx, mdRoot));
   if (!(folder instanceof TFolder)) return null;
-  const key = hubKey(ctx.page, ctx.selId);
+  const key = hubKeyFor(ctx);
   for (const child of folder.children) {
     // Match exact key or "key — slug.md" (trailing space avoids 96 vs 960 prefix collisions).
     if (child instanceof TFile && (child.name === key + ".md" || child.name.startsWith(key + " "))) {
@@ -60,46 +61,91 @@ export function findHub(app: App, ctx: ChatContext): TFile | null {
   return null;
 }
 
-export async function findOrCreateHub(app: App, ctx: ChatContext): Promise<TFile> {
-  const existing = findHub(app, ctx);
+export async function findOrCreateHub(app: App, ctx: ChatContext, mdRoot: string): Promise<TFile> {
+  const existing = findHub(app, ctx, mdRoot);
   if (existing) return existing;
 
-  const folder = annotationsFolder(ctx.pdfPath, ctx.pdfName);
+  const folder = hubsFolder(ctx, mdRoot);
   await ensureFolder(app, folder);
-  const path = `${folder}/${hubKey(ctx.page, ctx.selId)} — ${slugify(ctx.passage)}.md`;
+  // Selection hubs get a slug from the passage (many per folder); a file hub is unique in its
+  // folder and the folder is already named after the file, so the bare key reads better.
+  const name =
+    ctx.scope === "selection" ? `${hubKey(ctx.page, ctx.selId)} — ${slugify(ctx.passage)}` : hubKeyFor(ctx);
+  const path = `${folder}/${name}.md`;
   try {
     return await app.vault.create(path, hubTemplate(ctx));
   } catch (e) {
-    // Idempotent under races: a concurrent generation on the SAME highlight may have created the
+    // Idempotent under races: a concurrent generation on the SAME anchor may have created the
     // hub between our findHub() and create(). Return the now-existing file instead of throwing
     // (which would lose this generation's transcript + entry). See background-continue (Generation).
-    const found = findHub(app, ctx) ?? app.vault.getAbstractFileByPath(path);
+    const found = findHub(app, ctx, mdRoot) ?? app.vault.getAbstractFileByPath(path);
     if (found instanceof TFile) return found;
     throw e;
   }
 }
 
+/**
+ * Wikilink to the source file. Markdown notes are linked by PATH (with an alias) because basenames
+ * are not unique — a bare "[[epsilon-machine]]" would resolve to whichever note Obsidian picks.
+ * PDFs keep the bare-name link that every existing hub already uses.
+ */
+export function sourceLink(ctx: ChatContext): string {
+  if (ctx.kind === "pdf") return `[[${ctx.fileName}]]`;
+  return `[[${ctx.filePath.replace(/\.md$/i, "")}|${stemOf(ctx.fileName)}]]`;
+}
+
 function hubTemplate(ctx: ChatContext): string {
-  const stem = stemOf(ctx.pdfName);
-  const link = `[[${ctx.pdfName}#page=${ctx.page}&selection=${ctx.selId}&color=${ctx.color}|${stem}, page ${ctx.page}]]`;
-  return [
+  const stem = stemOf(ctx.fileName);
+  const common = [
     "---",
     "augmented-pdf: hub",
-    `pdf: "[[${ctx.pdfName}]]"`,
-    `page: ${ctx.page}`,
-    `selection: "${ctx.selId}"`,
-    `color: ${ctx.color}`,
-    `highlight-key: "${ctx.pdfName}|${ctx.page}|${ctx.selId}"`,
-    `passage: ${JSON.stringify(oneLine(ctx.passage))}`,
+    `scope: ${ctx.scope}`,
+    `kind: ${ctx.kind}`,
+    `source: "${sourceLink(ctx)}"`,
+    `source-path: ${JSON.stringify(ctx.filePath)}`,
+  ];
+  if (ctx.scope === "selection") {
+    const link = `[[${ctx.fileName}#page=${ctx.page}&selection=${ctx.selId}&color=${ctx.color}|${stem}, page ${ctx.page}]]`;
+    return [
+      ...common,
+      // `pdf:` is kept alongside `source:` so the 123 existing hubs, and any Dataview queries over
+      // them, keep working unchanged.
+      `pdf: "[[${ctx.fileName}]]"`,
+      `page: ${ctx.page}`,
+      `selection: "${ctx.selId}"`,
+      `color: ${ctx.color}`,
+      `highlight-key: "${ctx.fileName}|${ctx.page}|${ctx.selId}"`,
+      `passage: ${JSON.stringify(oneLine(ctx.passage))}`,
+      ...(ctx.litNote ? [`lit-note: "[[${ctx.litNote}]]"`] : []),
+      "chat-count: 0",
+      "tags: [augmented-pdf/annotation]",
+      "---",
+      "",
+      `> [!quote] Highlighted passage (p.${ctx.page})`,
+      "> " + ctx.passage.replace(/\n/g, "\n> "),
+      "",
+      `**Source:** ${link}`,
+      ...(ctx.litNote ? ["", `**Paper:** [[${ctx.litNote}]]`] : []),
+      "",
+      "```augmented-pdf-chat",
+      "new",
+      "```",
+      "",
+      "## Chats",
+      "",
+    ].join("\n");
+  }
+  // Whole-file hub. Deliberately carries no quote block: the chat is anchored to the file, and any
+  // passage the user had selected belongs to that one chat (it lives in the transcript), not here.
+  return [
+    ...common,
+    ...(ctx.kind === "pdf" ? [`pdf: "[[${ctx.fileName}]]"`] : []),
     ...(ctx.litNote ? [`lit-note: "[[${ctx.litNote}]]"`] : []),
     "chat-count: 0",
     "tags: [augmented-pdf/annotation]",
     "---",
     "",
-    `> [!quote] Highlighted passage (p.${ctx.page})`,
-    "> " + ctx.passage.replace(/\n/g, "\n> "),
-    "",
-    `**Source:** ${link}`,
+    `**Source:** ${sourceLink(ctx)}`,
     ...(ctx.litNote ? ["", `**Paper:** [[${ctx.litNote}]]`] : []),
     "",
     "```augmented-pdf-chat",

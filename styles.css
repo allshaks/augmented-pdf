@@ -42,6 +42,15 @@
 .apc-hub-btn {
   cursor: pointer;
 }
+.apc-hub-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-3);
+  align-items: center;
+}
+.apc-hub-open {
+  font-size: var(--font-ui-smaller);
+}
 
 /* Escape hatch: when toggled on, highlights stop intercepting the pointer so the
    user can drag-select the text underneath (double-click-to-open is disabled meanwhile). */
@@ -83,6 +92,9 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   margin-left: 0;
 }
 .apc-toolbar .apc-open {
+  font-size: var(--font-ui-smaller);
+}
+.apc-toolbar .apc-quote-btn {
   font-size: var(--font-ui-smaller);
 }
 .apc-suggest-sub {
@@ -223,6 +235,9 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
 }
 .apc-error {
   color: var(--text-error);
+  /* Errors are plain text (never rendered markdown), so honouring newlines is safe here — it keeps
+     the "what to do about it" advice on its own line, separate from the raw message. */
+  white-space: pre-wrap;
 }
 
 .apc-messages {
@@ -361,6 +376,37 @@ body.augmented-pdf-clickthrough .pdf-plus-backlink-highlight-layer .pdf-plus-bac
   display: flex;
   flex-direction: column;
   gap: var(--size-2-2);
+}
+
+/* @-attached context files, shown above the input (hidden entirely when none are attached). */
+.apc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-1);
+}
+.apc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-2-1);
+  max-width: 100%;
+  padding: 0 var(--size-2-2);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.apc-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.apc-chip-x {
+  cursor: pointer;
+  color: var(--text-faint);
+}
+.apc-chip-x:hover {
+  color: var(--text-error);
 }
 .apc-input {
   width: 100%;

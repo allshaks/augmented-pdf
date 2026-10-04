@@ -1,7 +1,8 @@
 import { App } from "obsidian";
+import { ChatContext } from "../types";
 
-export function stemOf(pdfName: string): string {
-  return pdfName.replace(/\.pdf$/i, "");
+export function stemOf(fileName: string): string {
+  return fileName.replace(/\.(pdf|md)$/i, "");
 }
 
 export function dirOf(pdfPath: string): string {
@@ -19,6 +20,34 @@ export function chatsFolder(pdfPath: string, pdfName: string): string {
   return (d ? d + "/" : "") + `${stemOf(pdfName)} (chats)`;
 }
 
+/**
+ * Chat folder for a markdown note: `{root}/{mirrored dir}/{stem}`, e.g.
+ * "wiki/concepts/epsilon-machine.md" -> "chats/wiki/concepts/epsilon-machine".
+ *
+ * The vault path is mirrored rather than flattened because note basenames are NOT unique (this
+ * vault has 19 duplicates, incl. two different "epsilon-machine" notes) — a flat {stem} folder
+ * would silently merge two notes' chats and their accumulated summaries into one hub.
+ *
+ * Unlike PDFs (whose annotation/chat folders sit beside them), markdown chats are collected under a
+ * single root so the user's own note tree stays free of generated sibling folders.
+ */
+export function mdChatFolder(mdPath: string, root: string): string {
+  const stem = stemOf(mdPath.replace(/^.*\//, ""));
+  return [root.replace(/^\/+|\/+$/g, ""), dirOf(mdPath), stem].filter(Boolean).join("/");
+}
+
+/** Where a source file's hub notes live. */
+export function hubsFolder(ctx: ChatContext, mdRoot: string): string {
+  return ctx.kind === "pdf"
+    ? annotationsFolder(ctx.filePath, ctx.fileName)
+    : mdChatFolder(ctx.filePath, mdRoot);
+}
+
+/** Where a source file's transcripts live. For markdown that's the same folder as its hub. */
+export function transcriptsFolder(ctx: ChatContext, mdRoot: string): string {
+  return ctx.kind === "pdf" ? chatsFolder(ctx.filePath, ctx.fileName) : mdChatFolder(ctx.filePath, mdRoot);
+}
+
 /** Sibling glossary note for a PDF, e.g. "{dir}/{stem} (glossary).md". */
 export function glossaryPath(pdfPath: string, pdfName: string): string {
   const d = dirOf(pdfPath);
@@ -30,10 +59,29 @@ export function hubKey(page: number, selId: string): string {
   return `p${page}-s${selId.replace(/,/g, ".")}`;
 }
 
+/**
+ * Filename prefix of the whole-file hub. Leading underscore so it can't collide with a selection
+ * hub (always "p<digit>…") and sorts to the top of the folder.
+ */
+export const FILE_HUB_KEY = "_hub";
+
+/** The hub filename prefix for a context: per-highlight for selections, one-per-file otherwise. */
+export function hubKeyFor(ctx: ChatContext): string {
+  return ctx.scope === "selection" ? hubKey(ctx.page, ctx.selId) : FILE_HUB_KEY;
+}
+
+/**
+ * Create `path`, including any missing parents. Walks the segments because markdown chat folders are
+ * nested several levels deep ("chats/wiki/concepts/epsilon-machine") and createFolder() on a path
+ * whose parents don't exist yet is not reliably recursive across Obsidian versions.
+ */
 export async function ensureFolder(app: App, path: string): Promise<void> {
-  if (!app.vault.getAbstractFileByPath(path)) {
+  let cur = "";
+  for (const seg of path.split("/").filter(Boolean)) {
+    cur = cur ? `${cur}/${seg}` : seg;
+    if (app.vault.getAbstractFileByPath(cur)) continue;
     try {
-      await app.vault.createFolder(path);
+      await app.vault.createFolder(cur);
     } catch {
       /* already exists or race — fine */
     }

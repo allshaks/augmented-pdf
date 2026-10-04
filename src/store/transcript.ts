@@ -1,18 +1,23 @@
 import { App, TFile, moment } from "obsidian";
 import { ChatContext, Turn } from "../types";
-import { chatsFolder, ensureFolder, oneLine, slugify, stemOf } from "./paths";
+import { ensureFolder, oneLine, slugify, stemOf, transcriptsFolder } from "./paths";
+import { sourceLink } from "./hub";
 
 /**
- * The transcript note — the full chat for one thread, in "<stem> (chats)/". Rewritten in place
- * while the thread is active (each turn + when the summary lands); never touched once the thread
- * ends. It links back to the hub (the hub owns the highlight), so we get exactly one highlight
- * per passage.
+ * The transcript note — the full chat for one thread. Rewritten in place while the thread is active
+ * (each turn + when the summary lands); never touched once the thread ends. It links back to the hub
+ * (the hub owns the anchor), so we get exactly one hub per highlight — or per file, for whole-file
+ * chats.
+ *
+ * Lives beside the PDF in "<stem> (chats)/", or under "<root>/<mirrored path>/" for a markdown note.
  */
 
 export interface TranscriptOpts {
   file: TFile | null; // null on first write -> create; otherwise modify in place
   sessionId: string;
   model: string;
+  /** Concrete model the alias resolved to, e.g. "claude-opus-5" — recorded as `model-id`. */
+  resolvedModel?: string | null;
   turns: Turn[];
   totalCost: number;
   hubBasename: string;
@@ -20,13 +25,18 @@ export interface TranscriptOpts {
   summary: string | null;
 }
 
-export async function writeTranscript(app: App, ctx: ChatContext, o: TranscriptOpts): Promise<TFile> {
+export async function writeTranscript(
+  app: App,
+  ctx: ChatContext,
+  o: TranscriptOpts,
+  mdRoot: string
+): Promise<TFile> {
   const body = buildBody(ctx, o);
   if (o.file) {
     await app.vault.modify(o.file, body);
     return o.file;
   }
-  const folder = chatsFolder(ctx.pdfPath, ctx.pdfName);
+  const folder = transcriptsFolder(ctx, mdRoot);
   await ensureFolder(app, folder);
   const stamp = moment().format("YYYY-MM-DD HHmm");
   const slug = slugify(firstUserText(o.turns));
@@ -36,18 +46,36 @@ export async function writeTranscript(app: App, ctx: ChatContext, o: TranscriptO
 }
 
 function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
-  const stem = stemOf(ctx.pdfName);
+  const stem = stemOf(ctx.fileName);
+  const anchor =
+    ctx.scope === "selection"
+      ? [
+          // `pdf:` is kept alongside `source:` so existing transcripts and any Dataview queries
+          // over them keep working unchanged.
+          `pdf: "[[${ctx.fileName}]]"`,
+          `page: ${ctx.page}`,
+          `selection: "${ctx.selId}"`,
+          `color: ${ctx.color}`,
+        ]
+      : ctx.kind === "pdf"
+        ? [`pdf: "[[${ctx.fileName}]]"`]
+        : [];
   const fm = [
     "---",
     "augmented-pdf: transcript",
-    `pdf: "[[${ctx.pdfName}]]"`,
-    `page: ${ctx.page}`,
-    `selection: "${ctx.selId}"`,
-    `color: ${ctx.color}`,
+    `scope: ${ctx.scope}`,
+    `kind: ${ctx.kind}`,
+    `source: "${sourceLink(ctx)}"`,
+    `source-path: ${JSON.stringify(ctx.filePath)}`,
+    ...anchor,
     `hub: "[[${o.hubBasename}]]"`,
     ...(ctx.litNote ? [`lit-note: "[[${ctx.litNote}]]"`] : []),
+    ...(ctx.attachments?.length ? [`context: ${JSON.stringify(ctx.attachments)}`] : []),
     `session-id: ${o.sessionId}`,
+    // `model:` stays the ALIAS (unchanged for the existing transcripts and any Dataview over them);
+    // `model-id` records which concrete model actually answered, since the alias floats with releases.
     `model: ${o.model}`,
+    ...(o.resolvedModel ? [`model-id: ${JSON.stringify(o.resolvedModel)}`] : []),
     `created: ${o.createdISO}`,
     `cost_usd: ${o.totalCost.toFixed(4)}`,
     `summary: ${o.summary ? JSON.stringify(oneLine(o.summary)) : '""'}`,
@@ -64,12 +92,18 @@ function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
     "continue",
     "```",
     "",
-    `> [!quote] Highlighted passage (p.${ctx.page})`,
-    "> " + ctx.passage.replace(/\n/g, "\n> "),
-    "",
-    `# Chat — ${stem}, p.${ctx.page}`,
-    "",
   ];
+  if (ctx.scope === "selection") {
+    parts.push(`> [!quote] Highlighted passage (p.${ctx.page})`, "> " + ctx.passage.replace(/\n/g, "\n> "), "");
+  } else if (ctx.passage) {
+    // A whole-file chat that started from selected text: the passage belongs to THIS chat (the hub
+    // is per-file), so it's recorded here rather than on the hub.
+    parts.push("> [!quote] Selected text", "> " + ctx.passage.replace(/\n/g, "\n> "), "");
+  }
+  if (ctx.attachments?.length) {
+    parts.push(`**Context:** ${ctx.attachments.map((p) => `[[${p.replace(/\.md$/i, "")}]]`).join(" · ")}`, "");
+  }
+  parts.push(ctx.scope === "selection" ? `# Chat — ${stem}, p.${ctx.page}` : `# Chat — ${stem}`, "");
   if (o.summary) {
     parts.push("## Summary", o.summary, "");
   }

@@ -1,11 +1,14 @@
 import { ItemView, MarkdownRenderer, Menu, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
-import { runClaude } from "../claude/runner";
-import { ChatContext, EFFORT_LEVELS, Turn } from "../types";
+import { AiMessage, AiRunHandle } from "../ai/provider";
+import { ChatContext, EFFORT_LEVELS, MODEL_CHOICES, Turn } from "../types";
 import { appendChatEntry, findHub, findOrCreateHub, readPriorSummaries, updateEntrySummary } from "../store/hub";
 import { writeTranscript } from "../store/transcript";
+import { PendingBacklink, backlinkMarker, writeBacklink } from "../store/backlink";
 import { generateSummary } from "../summary";
-import { oneLine } from "../store/paths";
+import { oneLine, stemOf } from "../store/paths";
 import { toObsidianMath } from "../format";
+import { MAX_ATTACHMENTS, buildAttachmentsBlock, buildSourceBlock } from "./context";
+import { FileSuggestModal } from "../modals/fileSuggest";
 import type AugmentedPdfPlugin from "../main";
 
 export const CHAT_VIEW_TYPE = "augmented-pdf-chat";
@@ -41,11 +44,37 @@ function toolVerb(name?: string): string {
   }
 }
 
+/**
+ * Turn a CLI error into advice the user can act on. "Try again" is right for an overloaded API but
+ * actively wrong for an expired login — the CLI already retried (up to 10x) and no amount of
+ * retrying will re-authenticate. Exported for testing.
+ */
+export function errorAdvice(detail: string): string {
+  const d = detail.toLowerCase();
+  if (/oauth|authentication_error|401|re-authenticate|failed to authenticate/.test(d)) {
+    return (
+      "Your Claude CLI login has expired. Run `claude login` in a terminal, then send this message " +
+      "again — retrying here won't help until you do."
+    );
+  }
+  if (/credit balance|insufficient/.test(d)) {
+    return "Your Claude account is out of credit. Top up (or enable usage credits) and try again.";
+  }
+  if (/enoent|not found|spawn/.test(d)) {
+    return "The `claude` binary couldn't be run — check the Claude CLI path in Augmented PDF settings.";
+  }
+  if (/overloaded|529|rate.?limit|timeout|econnreset|network|fetch failed/.test(d)) {
+    return "Usually transient (busy or a network blip) — try again in a moment.";
+  }
+  return "See the developer console for the full error envelope.";
+}
+
 /** Refs captured per-thread so async work survives the thread being reset. */
 interface ThreadRefs {
   ctx: ChatContext;
   sessionId: string;
   model: string;
+  resolvedModel: string | null;
   turns: Turn[];
   totalCost: number;
   hub: TFile;
@@ -63,6 +92,7 @@ interface Generation {
   ctx: ChatContext | null;
   sessionId: string;
   model: string;
+  resolvedModel: string | null; // concrete model the alias resolved to, from the CLI's init event
   turns: Turn[]; // shared ref with this.turns at send() time
   totalCost: number;
   hubFile: TFile | null;
@@ -70,10 +100,11 @@ interface Generation {
   createdISO: string | null;
   entryAppended: boolean;
   summary: string | null; // last known thread summary (preserved across transcript rewrites)
-  child: ReturnType<typeof runClaude> | null;
+  child: AiRunHandle | null;
   ticker: number | null;
   indicator: HTMLElement | null;
   detached: boolean;
+  pendingBacklinks: PendingBacklink[]; // "link back to this chat" marks to write once the transcript exists
 }
 
 export class ChatView extends ItemView {
@@ -85,8 +116,10 @@ export class ChatView extends ItemView {
   private totalCost = 0;
   private turns: Turn[] = [];
   private model: string;
+  /** Concrete model the alias resolved to this thread (from the CLI's init event); null until known. */
+  private resolvedModel: string | null = null;
   private effort: string; // session reasoning effort (toolbar); "default" => omit --effort
-  private child: ReturnType<typeof runClaude> | null = null;
+  private child: AiRunHandle | null = null;
 
   // persistence state
   private hubFile: TFile | null = null;
@@ -109,6 +142,12 @@ export class ChatView extends ItemView {
   private webEnabled = false;
   /** True only for an explicitly-started context-free chat (so the empty panel isn't mislabeled). */
   private generalChat = false;
+  /** Vault paths of files @-attached to THIS thread, inlined into the prompt and saved with it. */
+  private attachments: string[] = [];
+  /** Selection snapshotted on mousedown, before the click could collapse it. See captureSelectionOnMousedown. */
+  private pendingSelection = "";
+  /** Backlinks to drop into source notes once this thread has a saved transcript. See store/backlink.ts. */
+  private pendingBacklinks: PendingBacklink[] = [];
   /** Set once the view is closed, so a backgrounded reply's completion never writes to dead DOM. */
   private closed = false;
   /** Auto-scroll only while pinned to the bottom; cleared when the user scrolls up (so streaming
@@ -125,6 +164,7 @@ export class ChatView extends ItemView {
   private modelSelect!: HTMLSelectElement;
   private skillsToggle!: HTMLInputElement;
   private webToggle!: HTMLInputElement;
+  private chipsEl!: HTMLElement;
 
   constructor(leaf: WorkspaceLeaf, plugin: AugmentedPdfPlugin) {
     super(leaf);
@@ -165,7 +205,7 @@ export class ChatView extends ItemView {
     const toolbar = root.createDiv({ cls: "apc-toolbar" });
     toolbar.createSpan({ cls: "apc-toolbar-label", text: "Model" });
     this.modelSelect = toolbar.createEl("select", { cls: "dropdown apc-model" });
-    for (const m of ["haiku", "sonnet", "opus"]) {
+    for (const m of MODEL_CHOICES) {
       const o = this.modelSelect.createEl("option", { text: m, value: m });
       if (m === this.model) o.selected = true;
     }
@@ -214,12 +254,26 @@ export class ChatView extends ItemView {
       this.webEnabled = this.webToggle.checked;
     };
 
+    // Skills/Web are Claude-CLI-only — disable the toggles when GWDG is the active provider.
+    if (this.plugin.settings.aiProvider !== "claude") {
+      this.skillsToggle.disabled = true;
+      this.webToggle.disabled = true;
+      skillsLabel.setAttr("title", "Vault skills require the Claude CLI provider (Settings → AI provider).");
+      webLabel.setAttr("title", "Web access requires the Claude CLI provider (Settings → AI provider).");
+    }
+
+    // Pull the text selected in the open note/PDF into the message box as a quote.
+    const quoteBtn = toolbar.createEl("button", { cls: "apc-quote-btn", text: "❝ Selection" });
+    quoteBtn.setAttr("title", "Add the text selected in the open note or PDF to your message");
+    this.captureSelectionOnMousedown(quoteBtn);
+    quoteBtn.onclick = () => void this.plugin.addSelectionToChat(this.takePendingSelection());
+
+    // Points the new chat at whatever file is open (PDF or note) — no selection required. Falls back
+    // to a context-free chat when nothing suitable is open.
     const newBtn = toolbar.createEl("button", { cls: "apc-new", text: "New chat" });
-    newBtn.onclick = () => {
-      this.prepareSwitch();
-      this.resetThread();
-      this.renderHeader();
-    };
+    newBtn.setAttr("title", "Start a chat about the file currently open (or the selection in it)");
+    this.captureSelectionOnMousedown(newBtn);
+    newBtn.onclick = () => void this.plugin.newChatForActiveFile(this.takePendingSelection());
 
     // Vault-wide picker — reachable from any state, so a previous chat can be reopened even from the
     // empty/default panel (the in-header "Chats ▾" only lists the current paper's chats).
@@ -236,15 +290,27 @@ export class ChatView extends ItemView {
     });
 
     const inputRow = root.createDiv({ cls: "apc-input-row" });
+    this.chipsEl = inputRow.createDiv({ cls: "apc-chips" });
+    this.renderChips();
     this.inputEl = inputRow.createEl("textarea", {
       cls: "apc-input",
-      attr: { rows: "1", placeholder: "Ask about the passage…  (Enter to send · Shift+Enter = newline)" },
+      attr: {
+        rows: "1",
+        placeholder: "Ask about this file…  (Enter to send · Shift+Enter = newline · @ to attach a file)",
+      },
     });
     this.inputEl.addEventListener("input", () => this.autoGrowInput());
     this.inputEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         void this.send();
+        return;
+      }
+      // "@" opens the file picker. Only at a word boundary, so an email address or a decorator typed
+      // mid-word doesn't hijack the keystroke.
+      if (e.key === "@" && this.atWordBoundary()) {
+        e.preventDefault();
+        this.promptForAttachment();
       }
     });
     const btns = inputRow.createDiv({ cls: "apc-buttons" });
@@ -276,16 +342,21 @@ export class ChatView extends ItemView {
       }
       this.headerEl.createDiv({
         cls: "apc-empty",
-        text: "Select text in a PDF and choose “Ask Claude about selection”, or run “Ask Claude (general chat / run a vault skill)”. You can also reopen a saved chat with “Open chat” above.",
+        text: "Open a PDF or a note and hit “New chat” — the chat follows whatever file is open, and a selection is optional. You can also reopen a saved chat with “Open chat” above.",
       });
       return;
     }
     const srcRow = this.headerEl.createDiv({ cls: "apc-src-row" });
-    srcRow.createDiv({ cls: "apc-src", text: `${this.ctx.pdfName} · p.${this.ctx.page}` });
+    const label =
+      this.ctx.scope === "selection"
+        ? `${this.ctx.fileName} · p.${this.ctx.page}`
+        : `${stemOf(this.ctx.fileName)} · whole ${this.ctx.kind === "pdf" ? "document" : "note"}`;
+    srcRow.createDiv({ cls: "apc-src", text: label });
     const picker = srcRow.createEl("button", { cls: "apc-chats-btn", text: "Chats ▾" });
-    picker.setAttr("title", "Open another chat saved for this paper");
+    picker.setAttr("title", "Open another chat saved for this file");
     picker.onclick = (evt) => void this.showChatPicker(evt);
-    this.headerEl.createEl("blockquote", { cls: "apc-quote", text: this.ctx.passage });
+    // A whole-file chat has a quote only when the user happened to start it from a selection.
+    if (this.ctx.passage) this.headerEl.createEl("blockquote", { cls: "apc-quote", text: this.ctx.passage });
     if (this.skillsEnabled) {
       // On-state cue on the higher-risk path: a malicious PDF's text is in this prompt.
       this.headerEl.createDiv({
@@ -295,22 +366,138 @@ export class ChatView extends ItemView {
     }
     if (this.priorContext) {
       const n = (this.priorContext.match(/^### /gm) ?? []).length;
+      const what =
+        this.ctx.scope === "selection" ? "this highlight" : this.ctx.kind === "pdf" ? "this document" : "this note";
       this.headerEl.createDiv({
         cls: "apc-prior",
-        text: `${n} previous chat${n === 1 ? "" : "s"} on this highlight — context included.`,
+        text: `${n} previous chat${n === 1 ? "" : "s"} on ${what} — context included.`,
       });
     }
   }
 
-  /** Popup menu listing every saved chat for the current paper; selecting one re-opens it. */
-  private async showChatPicker(evt: MouseEvent): Promise<void> {
-    if (!this.ctx) {
-      new Notice("Open a chat from a PDF passage first.");
+  /**
+   * Read the note/PDF selection on mousedown and stash it.
+   *
+   * Clicking a sidebar button collapses the DOM selection in the pane the user was reading, and it
+   * also makes the sidebar the active leaf — so by the time `click` fires, a reading-view selection
+   * is already gone. `mousedown` fires before both, so it's the last moment the selection still
+   * exists. (In source/live-preview CodeMirror keeps its selection either way; this is what rescues
+   * reading view and PDFs.)
+   */
+  private captureSelectionOnMousedown(btn: HTMLElement): void {
+    this.registerDomEvent(btn, "mousedown", () => {
+      this.pendingSelection = this.plugin.currentSelectionText();
+    });
+  }
+
+  /** Consume the mousedown snapshot, falling back to a live read (e.g. keyboard activation). */
+  private takePendingSelection(): string {
+    const s = this.pendingSelection || this.plugin.currentSelectionText();
+    this.pendingSelection = ""; // never let a stale snapshot leak into a later click
+    return s;
+  }
+
+  /** Whether this panel is scoped to a document (vs. the empty panel or a general chat). */
+  hasContext(): boolean {
+    return this.ctx !== null;
+  }
+
+  /** True while nothing has been said yet — so re-scoping the panel can't discard a thread. */
+  isPristine(): boolean {
+    return this.turns.length === 0 && !this.activeGen;
+  }
+
+  /** Attach a vault file as context, if it isn't already and there's room. */
+  attachFile(path: string): void {
+    if (this.attachments.includes(path) || this.attachments.length >= MAX_ATTACHMENTS) return;
+    this.attachments.push(path);
+    this.renderChips();
+  }
+
+  /**
+   * Queue a "link back to this chat" to drop next to `anchorText` in a source note. Written once the
+   * thread has a saved transcript (see persistGen); markdown sources only — a PDF can't be edited,
+   * and our own generated notes are skipped so a chat never backlinks a hub/transcript.
+   */
+  queueBacklink(sourcePath: string, anchorText: string): void {
+    if (!this.plugin.settings.linkSelectionToChat) return;
+    const text = anchorText.trim();
+    if (!text || !/\.md$/i.test(sourcePath)) return;
+    const f = this.plugin.app.vault.getAbstractFileByPath(sourcePath);
+    if (f instanceof TFile) {
+      const kind = this.plugin.app.metadataCache.getFileCache(f)?.frontmatter?.["augmented-pdf"];
+      if (kind === "hub" || kind === "transcript") return;
+    }
+    if (this.pendingBacklinks.some((b) => b.sourcePath === sourcePath && b.anchorText === text)) return;
+    this.pendingBacklinks.push({ sourcePath, anchorText: text });
+  }
+
+  /** Drop a quoted passage into the message box; the user types their question around it. */
+  insertQuote(text: string): void {
+    const quote = text
+      .trim()
+      .split("\n")
+      .map((l) => "> " + l)
+      .join("\n");
+    const cur = this.inputEl.value.replace(/\s*$/, "");
+    this.inputEl.value = (cur ? cur + "\n\n" : "") + quote + "\n\n";
+    this.autoGrowInput();
+    this.inputEl.focus();
+    // Caret after the quote, so typing continues the question rather than editing the passage.
+    this.inputEl.setSelectionRange(this.inputEl.value.length, this.inputEl.value.length);
+  }
+
+  /** True when the caret sits at the start of a word, so "@" means "attach" rather than plain text. */
+  private atWordBoundary(): boolean {
+    const before = this.inputEl.value.slice(0, this.inputEl.selectionStart ?? 0);
+    return before === "" || /\s$/.test(before);
+  }
+
+  /** Fuzzy-pick a vault file and attach it to this thread as context. */
+  private promptForAttachment(): void {
+    if (this.attachments.length >= MAX_ATTACHMENTS) {
+      new Notice(`You can attach at most ${MAX_ATTACHMENTS} files to one chat.`);
       return;
     }
-    const entries = await this.plugin.listPaperChats(this.ctx.pdfPath, this.ctx.pdfName);
+    // Exclude what's already attached and the file the chat is already about (it's in the prompt).
+    const exclude = new Set(this.attachments);
+    if (this.ctx) exclude.add(this.ctx.filePath);
+    new FileSuggestModal(
+      this.plugin.app,
+      (f) => {
+        this.attachments.push(f.path);
+        this.renderChips();
+        this.inputEl.focus();
+      },
+      exclude
+    ).open();
+  }
+
+  private renderChips(): void {
+    if (!this.chipsEl) return;
+    this.chipsEl.empty();
+    this.chipsEl.toggle(this.attachments.length > 0);
+    for (const path of this.attachments) {
+      const chip = this.chipsEl.createDiv({ cls: "apc-chip" });
+      chip.createSpan({ cls: "apc-chip-name", text: path.replace(/^.*\//, "").replace(/\.md$/i, "") });
+      chip.setAttr("title", path);
+      const x = chip.createSpan({ cls: "apc-chip-x", text: "✕" });
+      x.onclick = () => {
+        this.attachments = this.attachments.filter((p) => p !== path);
+        this.renderChips();
+      };
+    }
+  }
+
+  /** Popup menu listing every saved chat for the current file; selecting one re-opens it. */
+  private async showChatPicker(evt: MouseEvent): Promise<void> {
+    if (!this.ctx) {
+      new Notice("Open a chat about a file first.");
+      return;
+    }
+    const entries = await this.plugin.listFileChats(this.ctx);
     if (!entries.length) {
-      new Notice("No saved chats for this paper yet.");
+      new Notice("No saved chats for this file yet.");
       return;
     }
     const menu = new Menu();
@@ -348,11 +535,15 @@ export class ChatView extends ItemView {
     if (this.webToggle) this.webToggle.checked = enabled;
   }
 
-  /** Seed a NEW chat thread for a selection. */
+  /** Seed a NEW chat thread for a file or selection. */
   setContext(ctx: ChatContext): void {
     this.prepareSwitch(); // detach an in-flight reply (keep it running) or summarize the idle thread
     this.resetThread();
     this.ctx = ctx;
+    this.attachments = ctx.attachments?.slice() ?? [];
+    this.renderChips();
+    // A note selection that became this chat's focus deserves a link back, next to the passage.
+    if (ctx.scope === "file" && ctx.kind === "md" && ctx.passage) this.queueBacklink(ctx.filePath, ctx.passage);
     this.renderHeader();
     window.setTimeout(() => this.inputEl?.focus(), 0);
     void this.loadPriorContext(ctx);
@@ -365,6 +556,7 @@ export class ChatView extends ItemView {
     turns: Turn[];
     totalCost: number;
     model: string;
+    resolvedModel?: string | null;
     hubFile: TFile | null;
     transcriptFile: TFile;
     createdISO: string;
@@ -375,7 +567,10 @@ export class ChatView extends ItemView {
       window.clearTimeout(this.summaryTimer);
       this.summaryTimer = null;
     }
+    this.pendingBacklinks = []; // reopening a saved chat: its passages were already backlinked
     this.ctx = o.ctx;
+    this.attachments = o.ctx.attachments?.slice() ?? [];
+    this.renderChips();
     this.generalChat = false;
     this.sessionId = o.sessionId;
     this.turns = o.turns.slice();
@@ -383,6 +578,7 @@ export class ChatView extends ItemView {
     this.turnCount = this.turns.filter((t) => t.role === "claude").length;
     this.totalCost = o.totalCost;
     this.model = o.model;
+    this.resolvedModel = o.resolvedModel ?? null;
     this.hubFile = o.hubFile;
     this.transcriptFile = o.transcriptFile;
     this.createdISO = o.createdISO;
@@ -413,6 +609,7 @@ export class ChatView extends ItemView {
       this.summaryTimer = null;
     }
     this.sessionId = crypto.randomUUID();
+    this.resolvedModel = null;
     this.generalChat = false;
     this.turnCount = 0;
     this.totalCost = 0;
@@ -425,13 +622,16 @@ export class ChatView extends ItemView {
     this.summarizedTurnCount = 0;
     this.priorContext = "";
     this.stickToBottom = true;
+    this.attachments = [];
+    this.pendingBacklinks = []; // switching threads drops any selection queued-but-never-sent
+    this.renderChips();
     this.messagesEl?.empty();
     this.statusEl?.setText("");
   }
 
   private async loadPriorContext(ctx: ChatContext): Promise<void> {
     try {
-      const hub = findHub(this.plugin.app, ctx);
+      const hub = findHub(this.plugin.app, ctx, this.plugin.settings.mdChatsRoot);
       if (!hub) return;
       const prior = await readPriorSummaries(this.plugin.app, hub);
       // Guard against the thread having changed while we awaited.
@@ -500,7 +700,7 @@ export class ChatView extends ItemView {
     this.sendBtn.toggle(!on);
     this.stopBtn.toggle(on);
     this.inputEl.disabled = on;
-    if (on) this.statusEl.setText("Claude is thinking…");
+    if (on) this.statusEl.setText("Thinking…");
   }
 
   private async send(): Promise<void> {
@@ -530,10 +730,18 @@ export class ChatView extends ItemView {
     // own. `turns` shares the array reference with this.turns; resetThread reassigns this.turns to a
     // fresh array, so a detached gen keeps the old thread's turns. This is what lets a reply keep
     // running (and save itself) after the panel switches to a new chat.
+    // Fold the @-attachments into the thread's context before capturing it, so a detached generation
+    // saves exactly the set that was in its prompt even if the panel switches mid-reply.
+    if (this.ctx) this.ctx = { ...this.ctx, attachments: this.attachments.slice() };
+    // Hand any queued backlinks to THIS reply's generation (which owns the transcript they'll point
+    // to) and clear ours, so they attach to this transcript and aren't re-written on a later turn.
+    const backlinks = this.pendingBacklinks.slice();
+    this.pendingBacklinks = [];
     const gen: Generation = {
       ctx: this.ctx,
       sessionId: this.sessionId!,
       model: this.model,
+      resolvedModel: this.resolvedModel,
       turns: this.turns,
       totalCost: this.totalCost,
       hubFile: this.hubFile,
@@ -545,6 +753,7 @@ export class ChatView extends ItemView {
       ticker: null,
       indicator: null,
       detached: false,
+      pendingBacklinks: backlinks,
     };
     this.activeGen = gen;
 
@@ -558,11 +767,13 @@ export class ChatView extends ItemView {
     this.scrollToBottom();
 
     const segments: string[] = []; // finished text segments — joined for persistence
+    const blocksSeen: string[] = []; // content-block trace, for diagnosing a reply that never arrives
     let textEl: HTMLElement | null = null; // the currently-streaming text segment (null when detached)
     let textAcc = "";
     let inText = false;
     let activityKind: "thinking" | "tool" | null = null;
     let activityStart = 0;
+    let toolInputChars = 0; // bytes of the current tool's input generated so far (Write/Edit payload)
 
     const closeTextSegment = () => {
       if (!inText) return;
@@ -602,6 +813,7 @@ export class ChatView extends ItemView {
     const startActivity = (kind: "thinking" | "tool", label: string) => {
       activityKind = kind;
       activityStart = Date.now();
+      toolInputChars = 0;
       if (gen.detached) return; // a backgrounded reply needs no live indicator
       const el = stream.createDiv({ cls: "apc-thinking" });
       el.hide();
@@ -609,7 +821,12 @@ export class ChatView extends ItemView {
       gen.ticker = window.setInterval(() => {
         const ms = Date.now() - activityStart;
         if (ms < 350) return; // debounce so sub-350ms blocks never flicker into view
-        el.setText(kind === "thinking" ? `${label} ${Math.round(ms / 1000)}s` : label);
+        // Always show elapsed time (a static label reads as "stuck"). For a tool that's generating a
+        // large payload — Write/Edit regenerating file content, the slow, output-bound path — also
+        // show how much has been produced, so a long wait looks like progress, not a hang.
+        const secs = ` ${Math.round(ms / 1000)}s`;
+        const size = toolInputChars > 1024 ? ` · ${(toolInputChars / 1024).toFixed(1)} KB` : "";
+        el.setText(`${label}${secs}${size}`);
         el.show();
         this.autoScroll();
       }, 250);
@@ -618,28 +835,46 @@ export class ChatView extends ItemView {
     this.setStreaming(true);
 
     const isFirst = this.turnCount === 0;
+    const provider = this.plugin.getProvider();
+    // Skills/web are Claude-CLI-only; under a chat-only provider (GWDG) they're unavailable.
+    const useSkills = this.skillsEnabled && provider.capabilities.skills;
+    const useWeb = this.webEnabled && provider.capabilities.web;
+    // A whole-PDF chat works by having the model Read the file; a provider without tools would
+    // answer from the filename alone, so say so rather than let it hallucinate the paper.
+    if (gen.ctx?.scope === "file" && gen.ctx.kind === "pdf" && !provider.capabilities.readsFiles) {
+      new Notice(
+        `${provider.label} can't open PDFs — whole-document chats need the Claude CLI provider ` +
+          `(Settings → AI provider). Highlight a passage instead, or attach a note.`,
+        10000
+      );
+    }
     let sys: string;
-    if (this.ctx) {
-      sys =
-        `You are helping the user understand a passage from the PDF "${this.ctx.pdfName}" (page ${this.ctx.page}).\n` +
-        `Highlighted passage:\n"""\n${this.ctx.passage}\n"""\n` +
-        `Answer concisely and stay grounded in this passage.`;
+    if (gen.ctx) {
+      sys = await buildSourceBlock(this.plugin.app, gen.ctx);
       if (isFirst && this.priorContext) {
-        sys +=
-          `\n\nThis passage has been discussed before. Prior chat summaries (for continuity):\n` +
-          this.priorContext;
+        const what = gen.ctx.scope === "selection" ? "This passage" : "This file";
+        sys += `\n\n${what} has been discussed before. Prior chat summaries (for continuity):\n` + this.priorContext;
       }
     } else {
       sys =
         "You are a helpful assistant working inside the user's Obsidian vault " +
         "(the current working directory). Answer concisely.";
     }
-    if (this.skillsEnabled) {
+    sys += await buildAttachmentsBlock(this.plugin.app, gen.ctx?.attachments ?? this.attachments);
+    if (useSkills) {
       sys +=
         "\n\nThe vault's Claude Code skills are available (e.g. /capture-idea, /ingest-raw, " +
         "/query-vault, /find-connections). When the user asks you to capture, save, ingest, query, " +
         "or otherwise act on the vault, use the appropriate skill; file writes and shell commands " +
-        "are permitted in this vault.";
+        "are permitted in this vault." +
+        // Steer to the fast editing path: a full-file Write must regenerate the whole file (slow,
+        // and it shows as a long "Writing…" the user reads as a hang). Read-then-Edit only emits the
+        // changed span. Read is also a hard prerequisite of Edit, so this removes the failed first
+        // Edit attempt too.
+        "\n\nTo modify an existing file, Read it first, then make a focused Edit (the Edit tool " +
+        "requires a prior Read in this session). Prefer a targeted Edit over rewriting the whole file " +
+        "with Write — a full-file Write regenerates the entire file and is much slower. Reserve Write " +
+        "for genuinely new files.";
     }
     sys +=
       "\n\nFor math, use Obsidian MathJax: $...$ inline and $$...$$ for display; never \\( \\) or \\[ \\].";
@@ -677,41 +912,64 @@ export class ChatView extends ItemView {
     // Read-only allow-list for non-skills mode. WebSearch/WebFetch are appended only when the user
     // enabled web access (toolbar "Web" toggle / settings default) — web is read-only but also an
     // exfiltration channel, so it's opt-in. In skills mode, bypassPermissions already allows web.
-    const readOnlyTools = this.webEnabled ? "Read,Grep,Glob,WebSearch,WebFetch" : "Read,Grep,Glob";
+    const readOnlyTools = useWeb ? "Read,Grep,Glob,WebSearch,WebFetch" : "Read,Grep,Glob";
+
+    // Full message history for stateless providers (GWDG); the CLI ignores it and uses session resume.
+    // gen.turns already ends with the just-pushed user message, so don't append q again.
+    const messages: AiMessage[] = [
+      ...(sys ? [{ role: "system", content: sys } as AiMessage] : []),
+      ...gen.turns.map((t) => ({ role: t.role === "user" ? "user" : "assistant", content: t.text } as AiMessage)),
+    ];
 
     try {
-      gen.child = runClaude(
+      gen.child = provider.run(
       {
-        binPath: this.plugin.settings.claudeBinPath,
         prompt: q,
-        appendSystemPrompt: sys,
+        systemPrompt: sys,
+        messages,
         model: gen.model,
         effort: this.effort && this.effort !== "default" ? this.effort : undefined,
         // Skills mode bypasses per-action approval so skills can write/run commands; otherwise stay
         // read-only — pre-approve readOnlyTools (Read/Grep/Glob, +web when enabled), deny the rest.
-        ...(this.skillsEnabled
+        // (CLI-only knobs; the GWDG provider ignores them.)
+        ...(useSkills
           ? { permissionMode: "bypassPermissions" }
           : { allowedTools: readOnlyTools, permissionMode: "dontAsk" }),
-        cwd: this.plugin.vaultCwd(),
-        // Skip user-level settings (the remember plugin's SessionStart hook) — it runs on every call
-        // and stalls startup on the iCloud vault. Keeps auth + the vault's own .claude/skills.
-        settingSources: "project,local",
-        // Disable MCP so the account's claude.ai connectors don't connect (30s each) at startup.
-        noMcp: true,
         sessionId: isFirst ? gen.sessionId : undefined,
         resumeId: isFirst ? undefined : gen.sessionId,
       },
       {
         onEvent: (type, raw) => {
+          // The CLI's init event reports which concrete model the alias resolved to
+          // ("opus" -> "claude-opus-5"). Aliases float with releases, so record what actually ran.
+          if (type === "system") {
+            const init = raw as { subtype?: string; model?: string };
+            if (init?.subtype === "init" && typeof init.model === "string" && init.model) {
+              gen.resolvedModel = init.model;
+              if (this.activeGen === gen) this.resolvedModel = init.model;
+            }
+          }
           if (type === "rate_limit_event") {
-            const info = (raw as { rate_limit_info?: { status?: string; resetsAt?: number; rateLimitType?: string } })
-              ?.rate_limit_info;
+            const info = (raw as {
+              rate_limit_info?: {
+                status?: string;
+                resetsAt?: number;
+                rateLimitType?: string;
+                overageStatus?: string;
+                isUsingOverage?: boolean;
+              };
+            })?.rate_limit_info;
             const status = String(info?.status ?? "");
-            // "allowed"/"allowed_warning" mean the call proceeds; anything else = blocked on the limit.
-            if (status && !status.startsWith("allowed")) handleRateLimited(info ?? {});
+            // status "rejected" only means the INCLUDED 5-hour allowance is used up — the request still
+            // proceeds (and succeeds) when usage credits/overage cover it. So only hard-block when the
+            // limit is hit AND no credits are covering it; otherwise let the call run.
+            const usingCredits =
+              info?.isUsingOverage === true || String(info?.overageStatus ?? "").startsWith("allow");
+            if (status && !status.startsWith("allowed") && !usingCredits) handleRateLimited(info ?? {});
           }
         },
         onBlock: (kind, name) => {
+          blocksSeen.push(kind + (name ? `(${name})` : ""));
           if (kind === "text") {
             finalizeActivity(); // "Thinking…" → "Thought for Ns"
             closeTextSegment(); // safety: close any still-open text block first
@@ -721,6 +979,10 @@ export class ChatView extends ItemView {
             finalizeActivity();
             startActivity(kind === "thinking" ? "thinking" : "tool", kind === "thinking" ? "Thinking…" : toolVerb(name));
           }
+        },
+        onToolInput: (n) => {
+          // Feeds the "Writing… 12s · 8.4 KB" progress; the ticker reads toolInputChars each frame.
+          toolInputChars += n;
         },
         onText: (t) => {
           if (!inText) {
@@ -738,6 +1000,16 @@ export class ChatView extends ItemView {
           closeTextSegment();
           if (r.costUsd) gen.totalCost += r.costUsd;
           let reply = toObsidianMath(segments.join("\n\n").trim());
+          // The STREAMED text is authoritative — the `.result` envelope truncates on large outputs,
+          // which is why we accumulate onText in the first place. But if nothing streamed at all, the
+          // envelope still carries the model's final answer, and showing it beats showing nothing.
+          // (Chats with skills on have been seen finishing with no text block; rather than discard a
+          // perfectly good answer, fall back and render it.)
+          let usedEnvelope = false;
+          if (!reply && !r.isError && String(r.result ?? "").trim()) {
+            reply = toObsidianMath(String(r.result).trim());
+            usedEnvelope = true;
+          }
           // is_error result = the CLI completed but the API/run errored (often transient: overloaded,
           // a network blip, a usage limit). Surface the actual reason and log the full envelope.
           let errDetail = "";
@@ -749,12 +1021,47 @@ export class ChatView extends ItemView {
           gen.turns.push({ role: "claude", text: reply, costUsd: r.costUsd });
           if (!gen.detached) {
             if (r.isError) {
-              stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${errDetail} — often transient; try again.` });
-            } else if (!segments.length) {
-              stream.createDiv({ cls: "apc-body", text: "(no response)" });
+              stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${errDetail}\n\n${errorAdvice(errDetail)}` });
+            } else if (usedEnvelope) {
+              // The CLI parses a leading "/" as a slash command and reports an unknown one as a
+              // SUCCESS (is_error false, cost 0) whose only content is this line — so it can't be
+              // caught as an error. Spell out the cause, or it reads as the chat silently ignoring you.
+              if (/^Unknown command:/.test(reply)) {
+                stream.createDiv({
+                  cls: "apc-body apc-error",
+                  text:
+                    `${reply} — a message beginning with “/” is read as a slash command, not as text, ` +
+                    `so nothing was sent to the model. Remove the leading “/” and send it as a normal ` +
+                    `message (skills trigger from plain language), or use a skill that exists.`,
+                });
+              } else {
+                void this.renderMd(stream.createDiv({ cls: "apc-body" }), reply);
+              }
+            } else if (!reply) {
+              // A run that finishes cleanly yet says nothing is never normal — leave a durable trace
+              // instead of a bare "(no response)" the user can't act on or report.
+              console.warn("[augmented-pdf] empty response", {
+                blocks: blocksSeen,
+                subtype: r.subtype,
+                result: r.result,
+                skills: useSkills,
+                model: gen.model,
+                effort: this.effort,
+                raw: r.raw,
+              });
+              stream.createDiv({
+                cls: "apc-body apc-error",
+                text:
+                  `(no reply text — the model ran [${blocksSeen.join(" → ") || "nothing"}] and stopped` +
+                  `${r.subtype ? `, subtype "${r.subtype}"` : ""}. Full envelope logged to the console.)`,
+              });
             }
             const meta = wrap.createDiv({ cls: "apc-meta" });
-            meta.setText(`${gen.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${gen.totalCost.toFixed(4)}`);
+            meta.setText(
+              provider.capabilities.usd
+                ? `${gen.resolvedModel ?? gen.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${gen.totalCost.toFixed(4)}`
+                : `${this.plugin.settings.gwdgModel} · ${provider.label}`
+            );
             this.autoScroll();
           }
           void this.completeGeneration(gen);
@@ -765,8 +1072,8 @@ export class ChatView extends ItemView {
           closeTextSegment();
           console.error("[augmented-pdf] chat error", e);
           if (this.activeGen === gen) {
-            // Attached reply: show the error inline and reset (unchanged behavior).
-            stream.createDiv({ cls: "apc-body apc-error", text: "⚠️ " + e.message });
+            // Attached reply: show the error inline, with what to do about it, and reset.
+            stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${e.message}\n\n${errorAdvice(e.message)}` });
             this.activeGen = null;
             this.child = null;
             this.setStreaming(false);
@@ -901,6 +1208,7 @@ export class ChatView extends ItemView {
           ctx: gen.ctx,
           sessionId: gen.sessionId,
           model: gen.model,
+          resolvedModel: gen.resolvedModel,
           turns: gen.turns.slice(),
           totalCost: gen.totalCost,
           hub: gen.hubFile,
@@ -917,18 +1225,25 @@ export class ChatView extends ItemView {
   /** Create/update the transcript and ensure a hub entry exists for a generation's thread. */
   private async persistGen(gen: Generation): Promise<void> {
     if (!gen.ctx || !gen.sessionId) return;
+    const mdRoot = this.plugin.settings.mdChatsRoot;
     if (!gen.createdISO) gen.createdISO = moment().format();
-    if (!gen.hubFile) gen.hubFile = await findOrCreateHub(this.plugin.app, gen.ctx);
-    gen.transcriptFile = await writeTranscript(this.plugin.app, gen.ctx, {
-      file: gen.transcriptFile,
-      sessionId: gen.sessionId,
-      model: gen.model,
-      turns: gen.turns,
-      totalCost: gen.totalCost,
-      hubBasename: gen.hubFile.basename,
-      createdISO: gen.createdISO,
-      summary: gen.summary,
-    });
+    if (!gen.hubFile) gen.hubFile = await findOrCreateHub(this.plugin.app, gen.ctx, mdRoot);
+    gen.transcriptFile = await writeTranscript(
+      this.plugin.app,
+      gen.ctx,
+      {
+        file: gen.transcriptFile,
+        sessionId: gen.sessionId,
+        model: gen.model,
+        resolvedModel: gen.resolvedModel,
+        turns: gen.turns,
+        totalCost: gen.totalCost,
+        hubBasename: gen.hubFile.basename,
+        createdISO: gen.createdISO,
+        summary: gen.summary,
+      },
+      mdRoot
+    );
     if (!gen.entryAppended) {
       await appendChatEntry(this.plugin.app, gen.hubFile, {
         anchorId: gen.sessionId,
@@ -936,6 +1251,23 @@ export class ChatView extends ItemView {
         transcriptBasename: gen.transcriptFile.basename,
       });
       gen.entryAppended = true;
+    }
+    // Now that the transcript exists, drop the queued "link back to this chat" marks into their
+    // source notes. Anchor-not-found (e.g. a reading-view selection over formatted text, or an edit
+    // since) is permanent → drop it; a genuine write failure is kept for a later turn to retry.
+    if (gen.pendingBacklinks.length) {
+      const marker = backlinkMarker(gen.transcriptFile.basename);
+      const retry: PendingBacklink[] = [];
+      for (const b of gen.pendingBacklinks) {
+        try {
+          const ok = await writeBacklink(this.plugin.app, b.sourcePath, b.anchorText, marker);
+          if (!ok) console.warn("[augmented-pdf] backlink anchor not found; skipped", b.sourcePath);
+        } catch (e) {
+          console.warn("[augmented-pdf] backlink write failed; will retry", b.sourcePath, e);
+          retry.push(b);
+        }
+      }
+      gen.pendingBacklinks = retry;
     }
   }
 
@@ -958,6 +1290,7 @@ export class ChatView extends ItemView {
       ctx: this.ctx,
       sessionId: this.sessionId,
       model: this.model,
+      resolvedModel: this.resolvedModel,
       turns: this.turns.slice(),
       totalCost: this.totalCost,
       hub: this.hubFile,
@@ -980,16 +1313,22 @@ export class ChatView extends ItemView {
       const summary = await generateSummary(this.plugin, refs.turns);
       if (!summary) return;
       await updateEntrySummary(this.plugin.app, refs.hub, refs.sessionId, summary);
-      await writeTranscript(this.plugin.app, refs.ctx, {
-        file: refs.transcript,
-        sessionId: refs.sessionId,
-        model: refs.model,
-        turns: refs.turns,
-        totalCost: refs.totalCost,
-        hubBasename: refs.hub.basename,
-        createdISO: refs.createdISO,
-        summary,
-      });
+      await writeTranscript(
+        this.plugin.app,
+        refs.ctx,
+        {
+          file: refs.transcript,
+          sessionId: refs.sessionId,
+          model: refs.model,
+          resolvedModel: refs.resolvedModel,
+          turns: refs.turns,
+          totalCost: refs.totalCost,
+          hubBasename: refs.hub.basename,
+          createdISO: refs.createdISO,
+          summary,
+        },
+        this.plugin.settings.mdChatsRoot
+      );
       // Reflect in the live UI only if still the same thread AND the panel is still open
       // (a backgrounded reply can finish after the view closed — don't write to dead DOM).
       if (!this.closed && this.sessionId === refs.sessionId) {

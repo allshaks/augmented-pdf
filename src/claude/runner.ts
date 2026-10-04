@@ -70,6 +70,13 @@ export interface ClaudeHandlers {
    * and separate consecutive text blocks (verified shapes — see scripts/spike + PLAN §7).
    */
   onBlock?: (kind: string, name?: string) => void;
+  /**
+   * Called as a tool's INPUT streams in (Anthropic `input_json_delta`). `deltaChars` is the length
+   * of this fragment of the partial JSON. Writing a file means generating its whole content as tool
+   * input, which is slow and otherwise invisible — this lets the UI show live progress instead of a
+   * frozen "Writing…". Fires between a tool_use `content_block_start` and its `content_block_stop`.
+   */
+  onToolInput?: (deltaChars: number) => void;
   /** Raw event tap — useful for surfacing tool-use status or debugging. */
   onEvent?: (type: string | undefined, raw: unknown) => void;
   /** Final result envelope. */
@@ -167,6 +174,8 @@ function dispatch(line: string, handlers: ClaudeHandlers): boolean {
       handlers.onBlock?.(cb.type as string, cb.name as string | undefined);
     } else if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") {
       handlers.onText?.(ev.delta.text as string);
+    } else if (ev?.type === "content_block_delta" && ev.delta?.type === "input_json_delta") {
+      handlers.onToolInput?.(((ev.delta.partial_json as string | undefined) ?? "").length);
     }
     return false;
   } else if (evt?.type === "result") {
