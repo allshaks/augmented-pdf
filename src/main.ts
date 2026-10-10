@@ -14,6 +14,7 @@ import {
   WorkspaceLeaf,
 } from "obsidian";
 import { execFile } from "child_process";
+import { createHash } from "crypto";
 import { CHAT_VIEW_TYPE, ChatView } from "./chat/view";
 import { ChatContext, EFFORT_LEVELS, MODEL_CHOICES, SelectionContext, SourceKind } from "./types";
 import { getSelectedText, getSelectionInfo, isPdfPlusEnabled } from "./pdfplus";
@@ -33,16 +34,27 @@ import { stripControlChars } from "./format";
 import { NearbyChoice, NearbyHighlightModal } from "./modals/nearby";
 import { AllChatsModal, ChatPickerEntry } from "./modals/allChats";
 import { readGlossary } from "./store/glossary";
-import { startGlossaryBuild } from "./glossaryGen";
+import { glossaryBlockedReason, startGlossaryBuild } from "./glossaryGen";
 import { GlossaryLookupModal } from "./modals/glossaryLookup";
 import { AiProvider, ClaudeCliProvider } from "./ai/provider";
-import { GwdgHttpProvider } from "./ai/gwdg";
+import { GwdgHttpProvider, GwdgModelInfo, classifyGwdgModel } from "./ai/gwdg";
+import { CodexCliProvider, defaultCodexBin } from "./ai/codex";
+import {
+  defaultEffort,
+  defaultModel,
+  effortChoices,
+  fillSelect,
+  modelChoices,
+  setDefaultEffort,
+  setDefaultModel,
+  validModel,
+} from "./ai/catalog";
 import { countReconcileWork, reconcileAnnotations } from "./reconcile";
 
 /**
  * Augmented PDF — Phase 1 (Ask MVP) on top of the verified Phase 0 spikes.
  *
- *   - "Ask Claude about selection" opens a sidebar ChatView seeded with the passage.
+ *   - "Ask AI about selection" opens a sidebar ChatView seeded with the passage.
  *   - Streaming, multi-turn (session resume), per-chat model dropdown, inline cost.
  *   - "Save to note" writes a transcript .md carrying the PDF++ selection link.
  *   - "Write selection link (spike)" + "Preflight" kept as diagnostics.
@@ -77,14 +89,31 @@ interface AugmentedPdfSettings {
   allowWeb: boolean;
   /** Model used to build per-PDF glossaries (Claude reads the PDF): "sonnet" (default) | "haiku". */
   glossaryModel: string;
-  /** Active AI backend: "claude" (CLI, default; full features) | "gwdg" (GWDG Chat AI, HTTP). */
-  aiProvider: "claude" | "gwdg";
+  /**
+   * Active AI backend: "claude" (Claude CLI, default; full features) | "codex" (OpenAI's Codex CLI,
+   * ChatGPT-account auth; chat + summaries) | "gwdg" (GWDG Chat AI over HTTP; chat + summaries).
+   */
+  aiProvider: "claude" | "gwdg" | "codex";
+  /** Path to the codex binary; "" = auto-detect (it ships inside the ChatGPT app, not on PATH). */
+  codexBinPath: string;
+  /** Codex model slug; "" = whatever ~/.codex/config.toml sets as the default. */
+  codexModel: string;
+  /** Default reasoning effort for Codex chats ("default" = Codex's configured effort). */
+  codexEffort: string;
   /** GWDG Chat AI API key (Bearer). Stored locally; user-provided. */
   gwdgApiKey: string;
   /** OpenAI-compatible base URL for GWDG. */
   gwdgBaseUrl: string;
   /** GWDG model id used for chat/summaries. */
   gwdgModel: string;
+  /** Last /models result, classified (hosted vs external, chat vs embedding) — backs the picker. */
+  gwdgModels: GwdgModelInfo[];
+  /** When gwdgModels was fetched (epoch ms; 0 = never). */
+  gwdgModelsFetchedAt: number;
+  /** Default reasoning choice for GWDG chats — one of the model's options, or "default". */
+  gwdgEffort: string;
+  /** Convert whole PDFs with GWDG's Docling (tables/structure kept) instead of local text extraction. */
+  gwdgDocling: boolean;
   /**
    * Vault folder collecting chats about markdown notes, as "<root>/<note's path>/<stem>/". PDFs keep
    * their sibling "(annotations)"/"(chats)" folders; notes are gathered under one root instead so the
@@ -120,9 +149,16 @@ const DEFAULT_SETTINGS: AugmentedPdfSettings = {
   allowWeb: false,
   glossaryModel: "sonnet",
   aiProvider: "claude",
+  codexBinPath: "",
+  codexModel: "",
+  codexEffort: "default",
   gwdgApiKey: "",
   gwdgBaseUrl: "https://chat-ai.academiccloud.de/v1",
   gwdgModel: "meta-llama-3.1-8b-instruct",
+  gwdgModels: [],
+  gwdgModelsFetchedAt: 0,
+  gwdgEffort: "default",
+  gwdgDocling: true,
   mdChatsRoot: "chats",
   linkSelectionToChat: true,
 };
@@ -247,7 +283,7 @@ export default class AugmentedPdfPlugin extends Plugin {
     this.addCommand({
       // Id kept from when this was selection-only, so existing hotkey bindings survive.
       id: "ask-claude-open-chat",
-      name: "Ask Claude about this file or selection (open chat)",
+      name: "Ask AI about this file or selection (open chat)",
       // Default Cmd/Ctrl+Esc — rebindable in Settings → Hotkeys.
       hotkeys: [{ modifiers: ["Mod"], key: "Escape" }],
       callback: () => void this.newChatForActiveFile(),
@@ -261,12 +297,12 @@ export default class AugmentedPdfPlugin extends Plugin {
     });
     this.addCommand({
       id: "ask-claude-general-chat",
-      name: "Ask Claude (general chat / run a vault skill)",
+      name: "Ask AI (general chat / run a vault skill)",
       callback: () => void this.openGeneralChat(),
     });
     this.addCommand({
       id: "new-chat-on-annotation",
-      name: "Ask Claude: new chat on this annotation (run from a hub note)",
+      name: "Ask AI: new chat on this annotation (run from a hub note)",
       checkCallback: (checking: boolean) => {
         const f = this.app.workspace.getActiveFile();
         const isHub =
@@ -416,7 +452,7 @@ export default class AugmentedPdfPlugin extends Plugin {
       (this.app.workspace as any).on("pdf-menu", (menu: Menu) => {
         menu.addItem((item) =>
           item
-            .setTitle("Ask Claude about selection")
+            .setTitle("Ask AI about selection")
             .setIcon("bot")
             .onClick(() => void this.newChatForActiveFile())
         );
@@ -436,9 +472,39 @@ export default class AugmentedPdfPlugin extends Plugin {
     return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : process.cwd();
   }
 
+  /**
+   * Docling Markdown for a vault PDF, converted by GWDG and cached on disk so a paper is converted once
+   * (until it changes). The cache lives in the plugin folder under .obsidian, which vault repos ignore.
+   */
+  async doclingMarkdown(path: string): Promise<string> {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (!(f instanceof TFile)) throw new Error("PDF not found: " + path);
+    const dir = `${this.manifest.dir}/docling-cache`;
+    const file = `${dir}/${createHash("sha1").update(`${path}|${f.stat.mtime}|${f.stat.size}`).digest("hex")}.md`;
+    const ad = this.app.vault.adapter;
+    if (await ad.exists(file)) return ad.read(file);
+    const md = await new GwdgHttpProvider(this).convertPdf(new Uint8Array(await this.app.vault.readBinary(f)), f.name);
+    try {
+      if (!(await ad.exists(dir))) await ad.mkdir(dir);
+      await ad.write(file, md);
+    } catch (e) {
+      console.warn("[augmented-pdf] couldn't cache Docling output", e); // still usable this time
+    }
+    return md;
+  }
+
+  /** Rebuild open chat panels' provider-dependent controls (model/effort lists, toggles) after a switch. */
+  refreshChatViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
+      if (leaf.view instanceof ChatView) leaf.view.onProviderChanged();
+    }
+  }
+
   /** The active AI backend — Claude CLI (default) or GWDG Chat AI. */
   getProvider(): AiProvider {
-    return this.settings.aiProvider === "gwdg" ? new GwdgHttpProvider(this) : new ClaudeCliProvider(this);
+    if (this.settings.aiProvider === "gwdg") return new GwdgHttpProvider(this);
+    if (this.settings.aiProvider === "codex") return new CodexCliProvider(this);
+    return new ClaudeCliProvider(this);
   }
 
   private async activateChatView(): Promise<ChatView | null> {
@@ -616,6 +682,11 @@ export default class AugmentedPdfPlugin extends Plugin {
 
   /** Build (or refresh) a PDF's glossary in the background, with a live, cancellable progress notice. */
   async runGlossaryBuild(pdf: TFile): Promise<void> {
+    const blocked = glossaryBlockedReason(this.settings);
+    if (blocked) {
+      new Notice(blocked, 15000);
+      return;
+    }
     if (this.activeGlossaryBuild) {
       new Notice("A glossary build is already running — cancel it first or wait for it to finish.");
       return;
@@ -1066,6 +1137,9 @@ export default class AugmentedPdfPlugin extends Plugin {
       totalCost: Number(fm.cost_usd ?? 0),
       model: typeof fm.model === "string" ? fm.model : this.settings.model,
       resolvedModel: typeof fm["model-id"] === "string" ? fm["model-id"] : null,
+      // Absent on every chat before Codex existed — those were all Claude chats.
+      provider: typeof fm.provider === "string" ? fm.provider : "claude",
+      providerSession: typeof fm["provider-session"] === "string" ? fm["provider-session"] : null,
       hubFile: hub instanceof TFile ? hub : null,
       transcriptFile: file,
       createdISO: String(fm.created ?? "") || new Date().toISOString(),
@@ -1135,46 +1209,202 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  /**
+   * Provider first, then everything that depends on it: that provider's connection settings, then
+   * its default model and reasoning effort — listed from the shared catalog (ai/catalog.ts), so they
+   * always match the selected provider. Switching provider re-renders this and refreshes any open
+   * chat panel, so the panel's model/effort dropdowns follow immediately.
+   */
+  private renderProviderSection(containerEl: HTMLElement): void {
+    const s = this.plugin.settings;
+    const p = s.aiProvider;
+    containerEl.createEl("h3", { text: "AI provider" });
+
+    new Setting(containerEl)
+      .setName("Provider")
+      .setDesc(
+        "Claude CLI (default) — full features: chat, glossary, vault skills, web. Codex CLI (OpenAI) — chat " +
+          "& summaries with your ChatGPT account, read-only. GWDG Chat AI (HTTP) — chat & summaries via your " +
+          "GWDG academic account. Skills, web and glossary builds always use the Claude CLI; with GWDG selected " +
+          "glossary builds are switched off, since they'd send the PDF to Anthropic. The model and effort " +
+          "below follow this choice, and an open chat panel updates immediately."
+      )
+      .addDropdown((d) =>
+        d
+          .addOption("claude", "Claude CLI")
+          .addOption("codex", "Codex CLI (OpenAI)")
+          .addOption("gwdg", "GWDG Chat AI")
+          .setValue(p)
+          .onChange(async (v) => {
+            s.aiProvider = v === "gwdg" || v === "codex" ? v : "claude";
+            await this.plugin.saveSettings();
+            this.plugin.refreshChatViews();
+            this.display();
+          })
+      );
+
+    // ---- connection settings for the selected provider --------------------------------
+    // The Claude CLI path is shown unless GWDG is selected: under Codex it's still what builds
+    // glossaries; under GWDG nothing uses Claude (glossary builds are refused there).
+    if (p !== "gwdg") {
+      new Setting(containerEl)
+        .setName("Claude CLI path")
+        .setDesc(
+          (p === "codex" ? "Used for glossary builds (chats use Codex). " : "") +
+            "Absolute path recommended (GUI apps don't inherit your shell PATH). Find it with `which claude`."
+        )
+        .addText((t) =>
+          t
+            .setPlaceholder("claude")
+            .setValue(s.claudeBinPath)
+            .onChange(async (v) => {
+              s.claudeBinPath = v.trim() || "claude";
+              await this.plugin.saveSettings();
+            })
+        );
+    }
+    if (p === "codex") {
+      const detected = defaultCodexBin();
+      new Setting(containerEl)
+        .setName("Codex CLI path")
+        .setDesc(
+          `Leave empty to auto-detect (found: ${detected}). Codex ships inside the ChatGPT desktop app — ` +
+            "sign in to Codex there (your ChatGPT account, no API key). Chats run in Codex's read-only " +
+            "sandbox: it can read your notes and PDFs, never write."
+        )
+        .addText((t) =>
+          t
+            .setPlaceholder(detected)
+            .setValue(s.codexBinPath)
+            .onChange(async (v) => {
+              s.codexBinPath = v.trim();
+              await this.plugin.saveSettings();
+            })
+        );
+    }
+    if (p === "gwdg") {
+      new Setting(containerEl)
+        .setName("GWDG API key")
+        .setDesc(
+          "Request one on the KISSKI LLM Service page (kisski.gwdg.de → “Book”). Stored locally in this " +
+            "vault's plugin data — never share it."
+        )
+        .addText((t) => {
+          t.setPlaceholder("paste your key")
+            .setValue(s.gwdgApiKey)
+            .onChange(async (v) => {
+              s.gwdgApiKey = v.trim();
+              await this.plugin.saveSettings();
+            });
+          t.inputEl.type = "password";
+          t.inputEl.style.width = "22em";
+        });
+      new Setting(containerEl)
+        .setName("GWDG base URL")
+        .setDesc("OpenAI-compatible endpoint base.")
+        .addText((t) =>
+          t
+            .setPlaceholder("https://chat-ai.academiccloud.de/v1")
+            .setValue(s.gwdgBaseUrl)
+            .onChange(async (v) => {
+              s.gwdgBaseUrl = v.trim() || "https://chat-ai.academiccloud.de/v1";
+              await this.plugin.saveSettings();
+            })
+        );
+      new Setting(containerEl)
+        .setName("Convert whole PDFs with Docling")
+        .setDesc(
+          "GWDG can't open files itself, so for a whole-PDF chat the paper's content is sent along. On: " +
+            "GWDG's Docling service converts it to Markdown first — keeps tables and structure, can read " +
+            "scanned pages; the PDF goes to GWDG (cached per file). Off: plain text is extracted locally. " +
+            "Either way, if Docling fails the local extraction is used."
+        )
+        .addToggle((t) =>
+          t.setValue(s.gwdgDocling).onChange(async (v) => {
+            s.gwdgDocling = v;
+            await this.plugin.saveSettings();
+          })
+        );
+    }
+
+    // ---- default model (this provider's list) -------------------------------------------
+    const model = validModel(this.plugin, p, defaultModel(this.plugin, p));
+    let desc = "Default for new chats — changeable per chat in the panel.";
+    if (p === "claude") desc += " These are aliases that always track the latest model of each tier.";
+    if (p === "codex") desc += " Models your ChatGPT account offers (Codex's own list); “Codex default” follows ~/.codex/config.toml.";
+    if (p === "gwdg") {
+      desc += s.gwdgModelsFetchedAt
+        ? ` List fetched ${new Date(s.gwdgModelsFetchedAt).toLocaleDateString()}.`
+        : " No list fetched yet — set your API key, then “Fetch models”.";
+      const info = s.gwdgModels.find((m) => m.id === model) ?? (model ? classifyGwdgModel({ id: model }) : null);
+      if (info?.kind === "embedding") desc += " ⚠ This is an EMBEDDING model and can't chat.";
+      else if (info?.external)
+        desc += " ⚠ EXTERNAL model: chats are proxied to OpenAI/Anthropic (they leave GWDG), and GWDG may not enable it for API keys.";
+    }
+    const modelSetting = new Setting(containerEl)
+      .setName("Default model")
+      .setDesc(desc)
+      .addDropdown((d) => {
+        fillSelect(d.selectEl, modelChoices(this.plugin, p), model);
+        d.onChange(async (v) => {
+          setDefaultModel(this.plugin, p, v);
+          await this.plugin.saveSettings();
+          this.display(); // effort levels (Codex) and the GWDG warning depend on the model
+        });
+      });
+    if (p === "gwdg") {
+      modelSetting.addButton((b) =>
+        b.setButtonText(s.gwdgModels.length ? "Refresh list" : "Fetch models").onClick(async () => {
+          b.setDisabled(true).setButtonText("Fetching…");
+          try {
+            const list = await new GwdgHttpProvider(this.plugin).fetchModels();
+            s.gwdgModels = list;
+            s.gwdgModelsFetchedAt = Date.now();
+            await this.plugin.saveSettings();
+            const ext = list.filter((m) => m.external).length;
+            const emb = list.filter((m) => m.kind === "embedding").length;
+            new Notice(`GWDG: ${list.length} models — ${list.length - ext - emb} hosted chat, ${ext} external, ${emb} embedding.`);
+            this.plugin.refreshChatViews();
+            this.display();
+          } catch (e) {
+            new Notice("Couldn't fetch models: " + (e instanceof Error ? e.message : String(e)), 8000);
+            b.setDisabled(false).setButtonText(s.gwdgModels.length ? "Refresh list" : "Fetch models");
+          }
+        })
+      );
+    }
+
+    // ---- default reasoning effort (this provider + model's levels) ---------------------
+    const efforts = effortChoices(this.plugin, p, model);
+    const effortSetting = new Setting(containerEl).setName(p === "gwdg" ? "Default reasoning" : "Default reasoning effort");
+    if (!efforts.length) {
+      effortSetting.setDesc("This model has no reasoning mode to adjust.");
+    } else {
+      const cur = efforts.includes(defaultEffort(this.plugin, p)) ? defaultEffort(this.plugin, p) : "default";
+      effortSetting
+        .setDesc(
+          p === "codex"
+            ? "The levels this model supports. “Default” uses Codex's configured effort."
+            : p === "gwdg"
+              ? "The reasoning options this model offers (from GWDG's own model table) — e.g. none/on for " +
+                "Qwen 3.5, none…high for DeepSeek V4. “Default” leaves the model's own setting."
+              : "Default for new chats — changeable per chat in the panel. “Default” uses the CLI's own default."
+        )
+        .addDropdown((d) => {
+          for (const lvl of efforts) d.addOption(lvl, lvl);
+          d.setValue(cur).onChange(async (v) => {
+            setDefaultEffort(this.plugin, p, v);
+            await this.plugin.saveSettings();
+          });
+        });
+    }
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl)
-      .setName("Claude binary path")
-      .setDesc("Absolute path recommended (GUI apps don't inherit your shell PATH). Find it with `which claude`.")
-      .addText((t) =>
-        t
-          .setPlaceholder("claude")
-          .setValue(this.plugin.settings.claudeBinPath)
-          .onChange(async (v) => {
-            this.plugin.settings.claudeBinPath = v.trim() || "claude";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Default model")
-      .setDesc("Default for new chats (changeable per chat in the panel).")
-      .addDropdown((d) =>
-        d
-          .addOptions(Object.fromEntries(MODEL_CHOICES.map((m) => [m, m])))
-          .setValue(this.plugin.settings.model)
-          .onChange(async (v) => {
-            this.plugin.settings.model = v;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("Default reasoning effort")
-      .setDesc("Default for new chats (changeable per chat in the panel). “Default” uses the CLI's own default.")
-      .addDropdown((d) => {
-        for (const lvl of EFFORT_LEVELS) d.addOption(lvl, lvl);
-        d.setValue(this.plugin.settings.effort).onChange(async (v) => {
-          this.plugin.settings.effort = v;
-          await this.plugin.saveSettings();
-        });
-      });
+    this.renderProviderSection(containerEl);
 
     new Setting(containerEl).setName("Highlight color").addText((t) =>
       t.setValue(this.plugin.settings.defaultColor).onChange(async (v) => {
@@ -1210,9 +1440,11 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Allow web search & fetch (default)")
       .setDesc(
-        "Default for new chats. Lets the model use WebSearch and WebFetch to look things up online " +
-          "and read URLs (read-only — it can't write files or run commands). You can also flip it " +
-          "per-chat with the “Web” toggle in the chat panel. ⚠️ Web access is also an exfiltration " +
+        "Default for new chats. Lets the model search the web and read URLs (read-only — it can't " +
+          "write files or run commands). Claude CLI uses its WebSearch/WebFetch tools; GWDG uses its own " +
+          "server-side search, which sends search queries to an external provider such as Google and " +
+          "isn't available for GWDG's external (OpenAI/Anthropic) models. Not available with Codex yet. " +
+          "Flip it per-chat with the “Web” toggle in the chat panel. ⚠️ Web access is also an exfiltration " +
           "channel: text in the prompt (e.g. a highlighted PDF passage) could try to make the model " +
           "put conversation content into a fetched URL. Leave it off unless you want online lookups."
       )
@@ -1281,86 +1513,6 @@ class AugmentedPdfSettingTab extends PluginSettingTab {
             this.plugin.settings.glossaryModel = v;
             await this.plugin.saveSettings();
           })
-      );
-
-    containerEl.createEl("h3", { text: "AI provider" });
-    new Setting(containerEl)
-      .setName("Provider")
-      .setDesc(
-        "Claude CLI (default) — full features: chat, glossary, vault skills, web. GWDG Chat AI (HTTP) — " +
-          "chat & summaries via your GWDG academic account; vault skills, web, and (for now) the glossary " +
-          "stay Claude-CLI-only. Takes effect on the next message / reopened chat panel."
-      )
-      .addDropdown((d) =>
-        d
-          .addOption("claude", "Claude CLI")
-          .addOption("gwdg", "GWDG Chat AI")
-          .setValue(this.plugin.settings.aiProvider)
-          .onChange(async (v) => {
-            this.plugin.settings.aiProvider = v === "gwdg" ? "gwdg" : "claude";
-            await this.plugin.saveSettings();
-            this.display();
-          })
-      );
-    new Setting(containerEl)
-      .setName("GWDG API key")
-      .setDesc("Bearer token from the KISSKI booking form. Stored locally in this vault's plugin data — never share it.")
-      .addText((t) => {
-        t.setPlaceholder("paste your key")
-          .setValue(this.plugin.settings.gwdgApiKey)
-          .onChange(async (v) => {
-            this.plugin.settings.gwdgApiKey = v.trim();
-            await this.plugin.saveSettings();
-          });
-        t.inputEl.type = "password";
-        t.inputEl.style.width = "22em";
-      });
-    new Setting(containerEl)
-      .setName("GWDG base URL")
-      .setDesc("OpenAI-compatible endpoint base.")
-      .addText((t) =>
-        t
-          .setPlaceholder("https://chat-ai.academiccloud.de/v1")
-          .setValue(this.plugin.settings.gwdgBaseUrl)
-          .onChange(async (v) => {
-            this.plugin.settings.gwdgBaseUrl = v.trim() || "https://chat-ai.academiccloud.de/v1";
-            await this.plugin.saveSettings();
-          })
-      );
-    new Setting(containerEl)
-      .setName("GWDG model")
-      .setDesc(
-        "API model id (e.g. meta-llama-3.1-8b-instruct). For data residency pick a GWDG-hosted OPEN model " +
-          "(Claude/GPT via GWDG are proxied to the vendor). “Fetch models” populates autocomplete from your account."
-      )
-      .addText((t) => {
-        t.setPlaceholder("meta-llama-3.1-8b-instruct")
-          .setValue(this.plugin.settings.gwdgModel)
-          .onChange(async (v) => {
-            this.plugin.settings.gwdgModel = v.trim();
-            await this.plugin.saveSettings();
-          });
-        t.inputEl.setAttr("list", "apc-gwdg-models");
-      })
-      .addButton((b) =>
-        b.setButtonText("Fetch models").onClick(async () => {
-          b.setDisabled(true).setButtonText("Fetching…");
-          try {
-            const ids = await new GwdgHttpProvider(this.plugin).fetchModels();
-            let dl = containerEl.querySelector("datalist#apc-gwdg-models") as HTMLDataListElement | null;
-            if (!dl) {
-              dl = containerEl.createEl("datalist");
-              dl.id = "apc-gwdg-models";
-            }
-            dl.empty();
-            ids.forEach((id) => dl!.createEl("option", { value: id }));
-            new Notice(`Fetched ${ids.length} GWDG models — type in the model field to autocomplete.`);
-          } catch (e) {
-            new Notice("Couldn't fetch models: " + (e instanceof Error ? e.message : String(e)), 8000);
-          } finally {
-            b.setDisabled(false).setButtonText("Fetch models");
-          }
-        })
       );
 
     containerEl.createEl("h3", { text: "Smart paste" });

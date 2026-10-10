@@ -1,7 +1,7 @@
 import { App, Component, MarkdownRenderer, Modal, Notice, TAbstractFile, TFile } from "obsidian";
 import { GlossaryEntry, normalizeKey, readGlossary, upsertEntry, writeGlossary } from "../store/glossary";
 import { glossaryPath } from "../store/paths";
-import { defineTermWithClaude } from "../glossaryGen";
+import { defineTermWithClaude, glossaryBlockedReason } from "../glossaryGen";
 import { toObsidianMath } from "../format";
 import type AugmentedPdfPlugin from "../main";
 
@@ -39,6 +39,12 @@ export class GlossaryLookupModal extends Modal {
   /** True while an "Ask Claude" call is in flight, to prevent overlapping calls. */
   private busy = false;
   private activeCancel: (() => void) | null = null;
+  /**
+   * Bumped by every redraw of the definition pane. renderDef awaits the markdown render, and two
+   * redraws often overlap (saving fires a vault "modify" → reload, while the save path redraws too);
+   * without this the stale one resumed and appended a second row of buttons under the fresh one.
+   */
+  private renderSeq = 0;
 
   private inputEl!: HTMLInputElement;
   private listEl!: HTMLElement;
@@ -162,6 +168,7 @@ export class GlossaryLookupModal extends Modal {
 
   private async renderDef(): Promise<void> {
     if (!this.loaded) return;
+    const seq = ++this.renderSeq;
     this.defComp?.unload();
     this.defComp = undefined;
     this.defEl.empty();
@@ -170,6 +177,13 @@ export class GlossaryLookupModal extends Modal {
     // Empty glossary + empty query → offer to build (the "build on first lookup" path).
     if (!this.terms.length && !q) {
       this.defEl.createDiv({ cls: "apc-gloss-empty", text: "No glossary for this PDF yet." });
+      // With GWDG selected a build would be refused — say why here, rather than offering a button
+      // that then claims "Building in the background…" while nothing is building.
+      const blocked = glossaryBlockedReason(this.plugin.settings);
+      if (blocked) {
+        this.defEl.createDiv({ cls: "apc-gloss-hint", text: blocked });
+        return;
+      }
       const row = this.defEl.createDiv({ cls: "apc-gloss-actions" });
       const build = row.createEl("button", { cls: "mod-cta", text: "Build glossary (Claude reads the PDF)" });
       build.onclick = () => {
@@ -203,6 +217,7 @@ export class GlossaryLookupModal extends Modal {
       } catch {
         pane.setText(entry.definition);
       }
+      if (seq !== this.renderSeq) return; // a newer redraw owns the pane now
     } else {
       this.defEl.createDiv({
         cls: "apc-gloss-hint",
@@ -225,6 +240,11 @@ export class GlossaryLookupModal extends Modal {
     const own = row.createEl("button", { text: existingDef ? "✍️ Edit / write your own" : "✍️ Write your own" });
     own.onclick = () => this.showWriteOwn(term, existingDef);
     const ask = row.createEl("button", { text: "✨ Ask Claude" });
+    const blocked = glossaryBlockedReason(this.plugin.settings);
+    if (blocked) {
+      ask.disabled = true;
+      ask.setAttr("title", blocked);
+    }
     ask.onclick = () => void this.askClaude(term);
   }
 
@@ -232,6 +252,7 @@ export class GlossaryLookupModal extends Modal {
 
   private showWriteOwn(term: string, existingDef: string): void {
     this.editing = true;
+    this.renderSeq++;
     this.defComp?.unload();
     this.defComp = undefined;
     this.defEl.empty();
@@ -265,11 +286,17 @@ export class GlossaryLookupModal extends Modal {
   }
 
   private async askClaude(term: string): Promise<void> {
+    const blocked = glossaryBlockedReason(this.plugin.settings);
+    if (blocked) {
+      new Notice(blocked, 15000);
+      return;
+    }
     if (this.busy) {
       new Notice("Already defining a term — wait for it to finish.");
       return;
     }
     this.busy = true;
+    this.renderSeq++;
     this.defComp?.unload();
     this.defComp = undefined;
     this.defEl.empty();

@@ -92,6 +92,23 @@ interface OneShot<T> {
 }
 
 /** Run one read-only Claude call over the PDF, resolving the accumulated text + cost. */
+/**
+ * Why AI glossary work is refused right now, or null if it's allowed. Building a glossary — and
+ * "Ask Claude" for a single term — has Claude read the PDF through the CLI; GWDG can't (no tools,
+ * and no PDF upload yet). So with GWDG selected these would silently send the paper to Anthropic,
+ * which is the opposite of why someone picks GWDG. Lookups in an existing glossary and writing your
+ * own definitions involve no AI and stay available.
+ */
+export function glossaryBlockedReason(settings: { aiProvider?: string }): string | null {
+  if (settings.aiProvider !== "gwdg") return null;
+  return (
+    "Glossary AI is off while GWDG is your AI provider. Building a glossary (or asking Claude to define " +
+    "a term) has Claude read the whole PDF, which would send the paper to Anthropic — not GWDG. To use " +
+    "it, switch Settings → Augmented PDF → AI provider to Claude CLI. Looking up terms in an existing " +
+    "glossary and writing your own definitions still work."
+  );
+}
+
 function runOverPdf(
   plugin: AugmentedPdfPlugin,
   prompt: string,
@@ -102,6 +119,13 @@ function runOverPdf(
   let phase = "starting";
   let terms = 0;
   const emit = () => onUpdate?.({ phase, terms });
+  // Backstop: every glossary path that reaches Claude goes through here, so refusing here means no
+  // current or future caller can send the PDF to Anthropic while GWDG is selected. (The entry points
+  // check first too, so the user gets the explanation in context rather than as a failed run.)
+  const blocked = glossaryBlockedReason(plugin.settings);
+  if (blocked) {
+    return { promise: Promise.resolve({ text: "", costUsd: 0, error: blocked }), cancel: () => {} };
+  }
   const promise = new Promise<{ text: string; costUsd: number; error?: string }>((resolve) => {
     let acc = "";
     child = runClaude(

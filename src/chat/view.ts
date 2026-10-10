@@ -1,14 +1,26 @@
 import { ItemView, MarkdownRenderer, Menu, Notice, TFile, WorkspaceLeaf, moment } from "obsidian";
 import { AiMessage, AiRunHandle } from "../ai/provider";
-import { ChatContext, EFFORT_LEVELS, MODEL_CHOICES, Turn } from "../types";
+import { ChatContext, Turn } from "../types";
 import { appendChatEntry, findHub, findOrCreateHub, readPriorSummaries, updateEntrySummary } from "../store/hub";
-import { writeTranscript } from "../store/transcript";
+import { assistantName, writeTranscript } from "../store/transcript";
 import { PendingBacklink, backlinkMarker, writeBacklink } from "../store/backlink";
 import { generateSummary } from "../summary";
 import { oneLine, stemOf } from "../store/paths";
 import { toObsidianMath } from "../format";
-import { MAX_ATTACHMENTS, buildAttachmentsBlock, buildSourceBlock } from "./context";
+import { MAX_ATTACHMENTS, buildAttachmentsBlock, buildSourceBlock, pdfTextFor } from "./context";
 import { FileSuggestModal } from "../modals/fileSuggest";
+import { classifyGwdgModel } from "../ai/gwdg";
+import {
+  ProviderId,
+  concreteModel,
+  effortLabel,
+  defaultEffort,
+  defaultModel,
+  effortChoices,
+  fillSelect,
+  modelChoices,
+  validModel,
+} from "../ai/catalog";
 import type AugmentedPdfPlugin from "../main";
 
 export const CHAT_VIEW_TYPE = "augmented-pdf-chat";
@@ -39,6 +51,10 @@ function toolVerb(name?: string): string {
     case "WebFetch":
     case "WebSearch":
       return "Searching the web…";
+    case "Waiting": // GWDG: request sent, no token yet (long prefill, e.g. an inlined paper)
+      return "Waiting for the model…";
+    case "WaitingWeb": // GWDG with web search: the gateway may be searching before it answers
+      return "Waiting for the model (it may search the web)…";
     default:
       return name ? `Running ${name}…` : "Working…";
   }
@@ -49,9 +65,16 @@ function toolVerb(name?: string): string {
  * actively wrong for an expired login — the CLI already retried (up to 10x) and no amount of
  * retrying will re-authenticate. Exported for testing.
  */
-export function errorAdvice(detail: string): string {
+export function errorAdvice(detail: string, provider: string = "claude"): string {
   const d = detail.toLowerCase();
-  if (/oauth|authentication_error|401|re-authenticate|failed to authenticate/.test(d)) {
+  if (/oauth|authentication_error|401|unauthori[sz]ed|re-authenticate|failed to authenticate|not logged in/.test(d)) {
+    if (provider === "codex") {
+      return (
+        "Codex isn't signed in (or its session expired). Sign in to Codex in the ChatGPT desktop app, " +
+        "then send this message again — retrying here won't help until you do."
+      );
+    }
+    if (provider === "gwdg") return "GWDG rejected the API key — check it in Settings → Augmented PDF → AI provider.";
     return (
       "Your Claude CLI login has expired. Run `claude login` in a terminal, then send this message " +
       "again — retrying here won't help until you do."
@@ -61,9 +84,19 @@ export function errorAdvice(detail: string): string {
     return "Your Claude account is out of credit. Top up (or enable usage credits) and try again.";
   }
   if (/enoent|not found|spawn/.test(d)) {
-    return "The `claude` binary couldn't be run — check the Claude CLI path in Augmented PDF settings.";
+    return provider === "codex"
+      ? "The `codex` binary couldn't be run — check the Codex CLI path in Augmented PDF settings."
+      : "The `claude` binary couldn't be run — check the Claude CLI path in Augmented PDF settings.";
   }
-  if (/overloaded|529|rate.?limit|timeout|econnreset|network|fetch failed/.test(d)) {
+  // Connection-level failures. ("ETIMEDOUT" doesn't contain "timeout", which is why these used to
+  // fall through to the generic console advice.)
+  if (/etimedout|econnreset|econnrefused|enotfound|eai_again|ehostunreach|enetunreach|socket hang up/.test(d)) {
+    return (
+      "Couldn't reach the server — usually a flaky or dropped connection. Check your internet and " +
+      "send again."
+    );
+  }
+  if (/overloaded|529|rate.?limit|timeout|network|fetch failed/.test(d)) {
     return "Usually transient (busy or a network blip) — try again in a moment.";
   }
   return "See the developer console for the full error envelope.";
@@ -75,6 +108,8 @@ interface ThreadRefs {
   sessionId: string;
   model: string;
   resolvedModel: string | null;
+  providerId: string;
+  providerThreadId: string | null;
   turns: Turn[];
   totalCost: number;
   hub: TFile;
@@ -93,6 +128,8 @@ interface Generation {
   sessionId: string;
   model: string;
   resolvedModel: string | null; // concrete model the alias resolved to, from the CLI's init event
+  providerId: string; // backend that ran this reply ("claude" | "codex" | "gwdg")
+  providerThreadId: string | null; // the backend's own session id when it mints one (Codex)
   turns: Turn[]; // shared ref with this.turns at send() time
   totalCost: number;
   hubFile: TFile | null;
@@ -118,6 +155,13 @@ export class ChatView extends ItemView {
   private model: string;
   /** Concrete model the alias resolved to this thread (from the CLI's init event); null until known. */
   private resolvedModel: string | null = null;
+  /**
+   * Which backend owns this thread, and that backend's own session id if it minted one (Codex does;
+   * for Claude the plugin's sessionId IS the CLI session). Sessions don't cross providers, so a thread
+   * started on one backend can't be resumed on another — see the guard at the top of send().
+   */
+  private threadProvider: string | null = null;
+  private providerThreadId: string | null = null;
   private effort: string; // session reasoning effort (toolbar); "default" => omit --effort
   private child: AiRunHandle | null = null;
 
@@ -144,6 +188,8 @@ export class ChatView extends ItemView {
   private generalChat = false;
   /** Vault paths of files @-attached to THIS thread, inlined into the prompt and saved with it. */
   private attachments: string[] = [];
+  /** True while send() awaits a PDF's text extraction — blocks a double Enter from sending twice. */
+  private preparing = false;
   /** Selection snapshotted on mousedown, before the click could collapse it. See captureSelectionOnMousedown. */
   private pendingSelection = "";
   /** Backlinks to drop into source notes once this thread has a saved transcript. See store/backlink.ts. */
@@ -162,6 +208,10 @@ export class ChatView extends ItemView {
   private stopBtn!: HTMLButtonElement;
   private statusEl!: HTMLElement;
   private modelSelect!: HTMLSelectElement;
+  private effortSelect!: HTMLSelectElement;
+  private effortLabel!: HTMLElement;
+  private skillsLabelEl!: HTMLElement;
+  private webLabelEl!: HTMLElement;
   private skillsToggle!: HTMLInputElement;
   private webToggle!: HTMLInputElement;
   private chipsEl!: HTMLElement;
@@ -169,8 +219,9 @@ export class ChatView extends ItemView {
   constructor(leaf: WorkspaceLeaf, plugin: AugmentedPdfPlugin) {
     super(leaf);
     this.plugin = plugin;
-    this.model = plugin.settings.model;
-    this.effort = plugin.settings.effort;
+    // Model/effort defaults come from the ACTIVE provider (each keeps its own), not Claude's.
+    this.model = defaultModel(plugin, plugin.settings.aiProvider);
+    this.effort = defaultEffort(plugin, plugin.settings.aiProvider);
     this.skillsEnabled = plugin.settings.allowSkills; // session starts at the persisted default
     this.webEnabled = plugin.settings.allowWeb; // ditto for web access
   }
@@ -179,7 +230,7 @@ export class ChatView extends ItemView {
     return CHAT_VIEW_TYPE;
   }
   getDisplayText(): string {
-    return "Ask Claude";
+    return "Ask AI";
   }
   getIcon(): string {
     return "bot";
@@ -205,23 +256,18 @@ export class ChatView extends ItemView {
     const toolbar = root.createDiv({ cls: "apc-toolbar" });
     toolbar.createSpan({ cls: "apc-toolbar-label", text: "Model" });
     this.modelSelect = toolbar.createEl("select", { cls: "dropdown apc-model" });
-    for (const m of MODEL_CHOICES) {
-      const o = this.modelSelect.createEl("option", { text: m, value: m });
-      if (m === this.model) o.selected = true;
-    }
     this.modelSelect.onchange = () => {
       this.model = this.modelSelect.value;
+      this.populateModelEffort(); // a Codex/GWDG model's effort/reasoning options depend on the model
+      this.syncProviderUi(); // GWDG web search depends on the model (not for external ones)
     };
 
-    toolbar.createSpan({ cls: "apc-toolbar-label", text: "Effort" });
-    const effortSelect = toolbar.createEl("select", { cls: "dropdown apc-effort" });
-    for (const lvl of EFFORT_LEVELS) {
-      const o = effortSelect.createEl("option", { text: lvl, value: lvl });
-      if (lvl === this.effort) o.selected = true;
-    }
-    effortSelect.onchange = () => {
-      this.effort = effortSelect.value;
+    this.effortLabel = toolbar.createSpan({ cls: "apc-toolbar-label", text: "Effort" });
+    this.effortSelect = toolbar.createEl("select", { cls: "dropdown apc-effort" });
+    this.effortSelect.onchange = () => {
+      this.effort = this.effortSelect.value;
     };
+    this.populateModelEffort();
 
     // Session-scoped quick toggle: flips write-access for THIS chat only (does not persist).
     // The persisted default lives in settings; here we just override it for the session.
@@ -231,6 +277,8 @@ export class ChatView extends ItemView {
       "Let vault skills write files & run commands for THIS chat (bypassPermissions). " +
         "Session-only — resets to the settings default next time. Off = read-only."
     );
+    this.skillsLabelEl = skillsLabel;
+    skillsLabel.dataset.title = skillsLabel.getAttr("title") ?? "";
     this.skillsToggle = skillsLabel.createEl("input", { type: "checkbox" });
     this.skillsToggle.checked = this.skillsEnabled;
     skillsLabel.createSpan({ text: "Skills" });
@@ -247,6 +295,8 @@ export class ChatView extends ItemView {
       "Let the model search the web & fetch URLs for THIS chat (read-only). " +
         "Session-only — resets to the settings default next time. Off = no internet access."
     );
+    this.webLabelEl = webLabel;
+    webLabel.dataset.title = webLabel.getAttr("title") ?? "";
     this.webToggle = webLabel.createEl("input", { type: "checkbox" });
     this.webToggle.checked = this.webEnabled;
     webLabel.createSpan({ text: "Web" });
@@ -254,13 +304,7 @@ export class ChatView extends ItemView {
       this.webEnabled = this.webToggle.checked;
     };
 
-    // Skills/Web are Claude-CLI-only — disable the toggles when GWDG is the active provider.
-    if (this.plugin.settings.aiProvider !== "claude") {
-      this.skillsToggle.disabled = true;
-      this.webToggle.disabled = true;
-      skillsLabel.setAttr("title", "Vault skills require the Claude CLI provider (Settings → AI provider).");
-      webLabel.setAttr("title", "Web access requires the Claude CLI provider (Settings → AI provider).");
-    }
+    this.syncProviderUi();
 
     // Pull the text selected in the open note/PDF into the message box as a quote.
     const quoteBtn = toolbar.createEl("button", { cls: "apc-quote-btn", text: "❝ Selection" });
@@ -322,6 +366,69 @@ export class ChatView extends ItemView {
 
     this.statusEl = root.createDiv({ cls: "apc-status" });
 
+    this.renderHeader();
+  }
+
+  /**
+   * Fill the model and effort dropdowns from the ACTIVE provider's catalog (ai/catalog.ts), keeping
+   * the current pick when it's valid there. Effort is hidden for providers without one (GWDG), and
+   * its levels follow the model (Codex models support different levels).
+   */
+  private populateModelEffort(): void {
+    if (!this.modelSelect) return;
+    const p = this.plugin.settings.aiProvider as ProviderId;
+    this.model = validModel(this.plugin, p, this.model);
+    fillSelect(this.modelSelect, modelChoices(this.plugin, p), this.model);
+    const efforts = effortChoices(this.plugin, p, this.model);
+    this.effortLabel.setText(effortLabel(p));
+    this.effortLabel.toggle(efforts.length > 0);
+    this.effortSelect.toggle(efforts.length > 0);
+    if (efforts.length) {
+      if (!efforts.includes(this.effort)) this.effort = "default";
+      fillSelect(this.effortSelect, efforts.map((l) => ({ value: l, label: l })), this.effort);
+    }
+  }
+
+  /**
+   * Skills need the Claude CLI. Web works on Claude, and on GWDG for GWDG-hosted models (its
+   * server-side search isn't offered for external ones); not on Codex yet. Each disabled toggle says why.
+   */
+  private syncProviderUi(): void {
+    if (!this.skillsToggle) return;
+    const p = this.plugin.settings.aiProvider;
+    const claude = p === "claude";
+    this.skillsToggle.disabled = !claude;
+    this.skillsLabelEl.setAttr(
+      "title",
+      claude ? this.skillsLabelEl.dataset.title ?? "" : "Vault skills require the Claude CLI provider (Settings → AI provider)."
+    );
+    const gwdgExternal = p === "gwdg" && !!classifyGwdgModel({ id: this.model || this.plugin.settings.gwdgModel })?.external;
+    const webOk = claude || (p === "gwdg" && !gwdgExternal);
+    this.webToggle.disabled = !webOk;
+    this.webLabelEl.setAttr(
+      "title",
+      webOk
+        ? p === "gwdg"
+          ? "Let GWDG search the web & fetch URLs for THIS chat — search queries go to an external provider (e.g. Google). Session-only."
+          : this.webLabelEl.dataset.title ?? ""
+        : gwdgExternal
+          ? "GWDG doesn't offer web search for external (OpenAI/Anthropic) models."
+          : "Web access isn't available with Codex yet."
+    );
+  }
+
+  /** GWDG whole-PDF chats can use GWDG's Docling (setting); other providers read PDFs themselves. */
+  private pdfConverter(p: string): ((path: string) => Promise<string>) | undefined {
+    return p === "gwdg" && this.plugin.settings.gwdgDocling ? (path) => this.plugin.doclingMarkdown(path) : undefined;
+  }
+
+  /** Called when the provider changes in settings: switch to that provider's defaults and controls. */
+  onProviderChanged(): void {
+    const p = this.plugin.settings.aiProvider;
+    this.model = defaultModel(this.plugin, p);
+    this.effort = defaultEffort(this.plugin, p);
+    this.populateModelEffort();
+    this.syncProviderUi();
     this.renderHeader();
   }
 
@@ -557,6 +664,8 @@ export class ChatView extends ItemView {
     totalCost: number;
     model: string;
     resolvedModel?: string | null;
+    provider?: string;
+    providerSession?: string | null;
     hubFile: TFile | null;
     transcriptFile: TFile;
     createdISO: string;
@@ -579,6 +688,8 @@ export class ChatView extends ItemView {
     this.totalCost = o.totalCost;
     this.model = o.model;
     this.resolvedModel = o.resolvedModel ?? null;
+    this.threadProvider = o.provider ?? "claude";
+    this.providerThreadId = o.providerSession ?? null;
     this.hubFile = o.hubFile;
     this.transcriptFile = o.transcriptFile;
     this.createdISO = o.createdISO;
@@ -587,9 +698,7 @@ export class ChatView extends ItemView {
     this.summarizedTurnCount = this.turns.length;
     this.priorContext = "";
 
-    if (this.modelSelect && Array.from(this.modelSelect.options).some((opt) => opt.value === o.model)) {
-      this.modelSelect.value = o.model;
-    }
+    this.populateModelEffort();
     this.messagesEl.empty();
     this.statusEl.setText(`Loaded chat · ${o.transcriptFile.basename}`);
     this.renderHeader();
@@ -610,6 +719,8 @@ export class ChatView extends ItemView {
     }
     this.sessionId = crypto.randomUUID();
     this.resolvedModel = null;
+    this.threadProvider = null;
+    this.providerThreadId = null;
     this.generalChat = false;
     this.turnCount = 0;
     this.totalCost = 0;
@@ -644,9 +755,14 @@ export class ChatView extends ItemView {
     }
   }
 
+  /** The reply heading: the thread's own backend once it has one, else the provider about to answer. */
+  private assistantLabel(): string {
+    return assistantName(this.threadProvider ?? this.plugin.settings.aiProvider);
+  }
+
   private addBubble(role: "user" | "claude", text: string, markdown = false): HTMLElement {
     const wrap = this.messagesEl.createDiv({ cls: `apc-msg apc-${role}` });
-    wrap.createDiv({ cls: "apc-role", text: role === "user" ? "You" : "Claude" });
+    wrap.createDiv({ cls: "apc-role", text: role === "user" ? "You" : this.assistantLabel() });
     const body = wrap.createDiv({ cls: "apc-body" });
     if (markdown && text) void this.renderMd(body, text);
     else body.setText(text);
@@ -710,6 +826,56 @@ export class ChatView extends ItemView {
     }
     const q = this.inputEl.value.trim();
     if (!q) return;
+    // A thread's history lives inside the backend that ran it: Claude can't resume a Codex thread or
+    // vice versa. Say so and stop, rather than send a turn that fails with a confusing "no session".
+    const current = this.plugin.getProvider();
+    if (this.threadProvider && this.turnCount > 0 && this.threadProvider !== current.id) {
+      const names: Record<string, string> = { claude: "Claude CLI", codex: "Codex CLI", gwdg: "GWDG Chat AI" };
+      new Notice(
+        `This chat was held with ${names[this.threadProvider] ?? this.threadProvider}, and its history ` +
+          `lives there — it can't be continued with ${current.label}. Switch the provider back in ` +
+          `Settings → Augmented PDF → AI provider to continue it, or start a new chat.`,
+        12000
+      );
+      return;
+    }
+    // Defensive: if settings changed without the panel being refreshed, never send another
+    // provider's model id (e.g. a Claude alias to Codex) — fall back to this provider's default.
+    this.model = validModel(this.plugin, current.id as ProviderId, this.model);
+    // A provider that can't open files (GWDG) gets a whole PDF as text, extracted here, locally, with
+    // Obsidian's own pdf.js — so the paper goes only to that provider. Checked BEFORE the turn is
+    // added: a PDF with no text layer (a scan) can't be chatted about this way, and saying so beats
+    // sending a question the model could only answer by pretending to have read the paper.
+    if (!current.capabilities.readsFiles && this.ctx?.scope === "file" && this.ctx.kind === "pdf") {
+      if (this.preparing) return;
+      this.preparing = true;
+      const convert = this.pdfConverter(current.id);
+      this.statusEl?.setText(convert ? "Converting the PDF with GWDG Docling… (first time can take a while)" : "Extracting the PDF's text…");
+      let r;
+      try {
+        r = await pdfTextFor(this.plugin.app, this.ctx.filePath, undefined, convert).catch(() => null);
+      } finally {
+        this.preparing = false;
+      }
+      if (!r?.text) {
+        this.statusEl?.setText("");
+        new Notice(
+          `Couldn't extract any text from “${this.ctx.fileName}” (it may be a scanned image). ` +
+            `${current.label} can't open files itself, so it can't chat about this whole PDF — ` +
+            `highlight a passage instead, or switch to Claude CLI or Codex CLI.`,
+          12000
+        );
+        return;
+      }
+      this.statusEl?.setText(
+        r.source === "docling"
+          ? `Sending the paper as Markdown (converted by GWDG Docling)${r.truncated ? " — cut off; the end doesn't fit" : ""}.`
+          : (r.note ? `${r.note}. ` : "") +
+              (r.truncated
+                ? `Sending pages 1–${r.pagesIncluded} of ${r.pages} as text (the rest doesn't fit).`
+                : `Sending the PDF's text (${r.pages} pages).`)
+      );
+    }
     // Mint a FRESH session id for every first-turn attempt (turnCount === 0), so retrying after a
     // failed turn 1 never reuses an id the CLI already registered ("Session ID … is already in use").
     // Continuations (turnCount > 0) keep the established id and --resume it.
@@ -742,6 +908,8 @@ export class ChatView extends ItemView {
       sessionId: this.sessionId!,
       model: this.model,
       resolvedModel: this.resolvedModel,
+      providerId: this.plugin.settings.aiProvider,
+      providerThreadId: this.providerThreadId,
       turns: this.turns,
       totalCost: this.totalCost,
       hubFile: this.hubFile,
@@ -762,7 +930,7 @@ export class ChatView extends ItemView {
     // "Reading…", …) for the model's thinking/tool pauses. Driven by content_block_start (onBlock),
     // so mid-stream pauses are visible and consecutive text blocks don't glue together.
     const wrap = this.messagesEl.createDiv({ cls: "apc-msg apc-claude" });
-    wrap.createDiv({ cls: "apc-role", text: "Claude" });
+    wrap.createDiv({ cls: "apc-role", text: this.assistantLabel() });
     const stream = wrap.createDiv({ cls: "apc-stream" });
     this.scrollToBottom();
 
@@ -836,21 +1004,24 @@ export class ChatView extends ItemView {
 
     const isFirst = this.turnCount === 0;
     const provider = this.plugin.getProvider();
+    this.threadProvider ??= provider.id;
+    // The toolbar's model is a Claude alias. Other backends run their own configured model, and that
+    // — not the meaningless alias — is what the transcript and the meta line must record.
+    if (provider.id !== "claude") {
+      // Record the concrete model this chat used (Codex "" = its configured default).
+      const m = concreteModel(this.plugin, provider.id, this.model);
+      gen.model = m;
+      gen.resolvedModel = m;
+    }
     // Skills/web are Claude-CLI-only; under a chat-only provider (GWDG) they're unavailable.
     const useSkills = this.skillsEnabled && provider.capabilities.skills;
     const useWeb = this.webEnabled && provider.capabilities.web;
-    // A whole-PDF chat works by having the model Read the file; a provider without tools would
-    // answer from the filename alone, so say so rather than let it hallucinate the paper.
-    if (gen.ctx?.scope === "file" && gen.ctx.kind === "pdf" && !provider.capabilities.readsFiles) {
-      new Notice(
-        `${provider.label} can't open PDFs — whole-document chats need the Claude CLI provider ` +
-          `(Settings → AI provider). Highlight a passage instead, or attach a note.`,
-        10000
-      );
-    }
     let sys: string;
     if (gen.ctx) {
-      sys = await buildSourceBlock(this.plugin.app, gen.ctx);
+      sys = await buildSourceBlock(this.plugin.app, gen.ctx, {
+        inlinePdf: !provider.capabilities.readsFiles,
+        convertPdf: this.pdfConverter(provider.id),
+      });
       if (isFirst && this.priorContext) {
         const what = gen.ctx.scope === "selection" ? "This passage" : "This file";
         sys += `\n\n${what} has been discussed before. Prior chat summaries (for continuity):\n` + this.priorContext;
@@ -860,7 +1031,10 @@ export class ChatView extends ItemView {
         "You are a helpful assistant working inside the user's Obsidian vault " +
         "(the current working directory). Answer concisely.";
     }
-    sys += await buildAttachmentsBlock(this.plugin.app, gen.ctx?.attachments ?? this.attachments);
+    sys += await buildAttachmentsBlock(this.plugin.app, gen.ctx?.attachments ?? this.attachments, {
+      inlinePdf: !provider.capabilities.readsFiles,
+      convertPdf: this.pdfConverter(provider.id),
+    });
     if (useSkills) {
       sys +=
         "\n\nThe vault's Claude Code skills are available (e.g. /capture-idea, /ingest-raw, " +
@@ -927,7 +1101,9 @@ export class ChatView extends ItemView {
         prompt: q,
         systemPrompt: sys,
         messages,
-        model: gen.model,
+        // Claude gets its alias; other providers get the model picked in the panel for this chat.
+        model: provider.id === "claude" ? gen.model : this.model,
+        web: useWeb,
         effort: this.effort && this.effort !== "default" ? this.effort : undefined,
         // Skills mode bypasses per-action approval so skills can write/run commands; otherwise stay
         // read-only — pre-approve readOnlyTools (Read/Grep/Glob, +web when enabled), deny the rest.
@@ -935,8 +1111,14 @@ export class ChatView extends ItemView {
         ...(useSkills
           ? { permissionMode: "bypassPermissions" }
           : { allowedTools: readOnlyTools, permissionMode: "dontAsk" }),
-        sessionId: isFirst ? gen.sessionId : undefined,
-        resumeId: isFirst ? undefined : gen.sessionId,
+        // Claude resumes by the plugin's own id; Codex by the thread id it minted on turn 1. (Codex
+        // always gets sessionId so a chat turn is never mistaken for a throwaway --ephemeral call.)
+        sessionId: isFirst || provider.id === "codex" ? gen.sessionId : undefined,
+        resumeId: isFirst
+          ? undefined
+          : provider.id === "codex"
+            ? gen.providerThreadId ?? undefined
+            : gen.sessionId,
       },
       {
         onEvent: (type, raw) => {
@@ -995,6 +1177,11 @@ export class ChatView extends ItemView {
           if (!gen.detached) this.autoScroll();
         },
         onDone: (r) => {
+          // Codex reports the session id it minted; keep it so the next turn can resume that thread.
+          if (provider.id === "codex" && r.sessionId) {
+            gen.providerThreadId = r.sessionId;
+            if (this.activeGen === gen) this.providerThreadId = r.sessionId;
+          }
           this.untrackChild(gen);
           finalizeActivity();
           closeTextSegment();
@@ -1021,7 +1208,7 @@ export class ChatView extends ItemView {
           gen.turns.push({ role: "claude", text: reply, costUsd: r.costUsd });
           if (!gen.detached) {
             if (r.isError) {
-              stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${errDetail}\n\n${errorAdvice(errDetail)}` });
+              stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${errDetail}\n\n${errorAdvice(errDetail, provider.id)}` });
             } else if (usedEnvelope) {
               // The CLI parses a leading "/" as a slash command and reports an unknown one as a
               // SUCCESS (is_error false, cost 0) whose only content is this line — so it can't be
@@ -1060,7 +1247,7 @@ export class ChatView extends ItemView {
             meta.setText(
               provider.capabilities.usd
                 ? `${gen.resolvedModel ?? gen.model} · $${(r.costUsd ?? 0).toFixed(4)}  ·  thread total $${gen.totalCost.toFixed(4)}`
-                : `${this.plugin.settings.gwdgModel} · ${provider.label}`
+                : `${gen.resolvedModel ?? gen.model} · ${provider.label}`
             );
             this.autoScroll();
           }
@@ -1073,7 +1260,7 @@ export class ChatView extends ItemView {
           console.error("[augmented-pdf] chat error", e);
           if (this.activeGen === gen) {
             // Attached reply: show the error inline, with what to do about it, and reset.
-            stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${e.message}\n\n${errorAdvice(e.message)}` });
+            stream.createDiv({ cls: "apc-body apc-error", text: `⚠️ ${e.message}\n\n${errorAdvice(e.message, provider.id)}` });
             this.activeGen = null;
             this.child = null;
             this.setStreaming(false);
@@ -1201,6 +1388,9 @@ export class ChatView extends ItemView {
         this.transcriptFile = gen.transcriptFile;
         this.createdISO = gen.createdISO;
         this.entryAppended = gen.entryAppended;
+        this.threadProvider = gen.providerId;
+        this.providerThreadId = gen.providerThreadId;
+        this.resolvedModel = gen.resolvedModel;
         this.statusEl?.setText(`Saved · annotation: ${gen.hubFile?.basename ?? ""}`);
         this.scheduleSummary(); // idle summary of the active thread
       } else if (gen.hubFile && gen.transcriptFile) {
@@ -1209,6 +1399,8 @@ export class ChatView extends ItemView {
           sessionId: gen.sessionId,
           model: gen.model,
           resolvedModel: gen.resolvedModel,
+          providerId: gen.providerId,
+          providerThreadId: gen.providerThreadId,
           turns: gen.turns.slice(),
           totalCost: gen.totalCost,
           hub: gen.hubFile,
@@ -1236,6 +1428,8 @@ export class ChatView extends ItemView {
         sessionId: gen.sessionId,
         model: gen.model,
         resolvedModel: gen.resolvedModel,
+        provider: gen.providerId,
+        providerSession: gen.providerThreadId,
         turns: gen.turns,
         totalCost: gen.totalCost,
         hubBasename: gen.hubFile.basename,
@@ -1291,6 +1485,8 @@ export class ChatView extends ItemView {
       sessionId: this.sessionId,
       model: this.model,
       resolvedModel: this.resolvedModel,
+      providerId: this.threadProvider ?? this.plugin.settings.aiProvider,
+      providerThreadId: this.providerThreadId,
       turns: this.turns.slice(),
       totalCost: this.totalCost,
       hub: this.hubFile,
@@ -1321,6 +1517,8 @@ export class ChatView extends ItemView {
           sessionId: refs.sessionId,
           model: refs.model,
           resolvedModel: refs.resolvedModel,
+          provider: refs.providerId,
+          providerSession: refs.providerThreadId,
           turns: refs.turns,
           totalCost: refs.totalCost,
           hubBasename: refs.hub.basename,

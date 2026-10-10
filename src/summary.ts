@@ -50,6 +50,8 @@ export function summarizeConversation(plugin: AugmentedPdfPlugin, convo: string)
         messages: [{ role: "user", content: prompt }],
         // CLI: haiku is plenty for summaries. GWDG: undefined → its configured model.
         model: provider.id === "claude" ? "haiku" : undefined,
+        // Codex: same model as chat but low reasoning effort — a summary doesn't need a long think.
+        effort: provider.id === "codex" ? "low" : undefined,
         permissionMode: "dontAsk", // CLI-only; ignored by GWDG
       },
       {

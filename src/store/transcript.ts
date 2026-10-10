@@ -18,6 +18,10 @@ export interface TranscriptOpts {
   model: string;
   /** Concrete model the alias resolved to, e.g. "claude-opus-5" — recorded as `model-id`. */
   resolvedModel?: string | null;
+  /** Which backend ran this chat ("claude" | "codex" | "gwdg"); omitted from the note for Claude. */
+  provider?: string;
+  /** The backend's own session id when it mints one (Codex's thread_id), needed to resume. */
+  providerSession?: string | null;
   turns: Turn[];
   totalCost: number;
   hubBasename: string;
@@ -76,6 +80,10 @@ function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
     // `model-id` records which concrete model actually answered, since the alias floats with releases.
     `model: ${o.model}`,
     ...(o.resolvedModel ? [`model-id: ${JSON.stringify(o.resolvedModel)}`] : []),
+    // Sessions don't cross providers, so a reopened chat must know whose it is. Claude chats omit
+    // the key (absent = claude), keeping every existing transcript's shape unchanged.
+    ...(o.provider && o.provider !== "claude" ? [`provider: ${o.provider}`] : []),
+    ...(o.providerSession ? [`provider-session: ${JSON.stringify(o.providerSession)}`] : []),
     `created: ${o.createdISO}`,
     `cost_usd: ${o.totalCost.toFixed(4)}`,
     `summary: ${o.summary ? JSON.stringify(oneLine(o.summary)) : '""'}`,
@@ -108,19 +116,24 @@ function buildBody(ctx: ChatContext, o: TranscriptOpts): string {
     parts.push("## Summary", o.summary, "");
   }
   for (const t of o.turns) {
-    parts.push(`## ${t.role === "user" ? "You" : "Claude"}`, t.text, "");
+    parts.push(`## ${t.role === "user" ? "You" : assistantName(o.provider)}`, t.text, "");
   }
   return parts.join("\n");
+}
+
+/** Who answered, for reply headings and chat bubbles. Claude stays "Claude" (every existing note). */
+export function assistantName(provider?: string | null): string {
+  return provider === "codex" ? "Codex" : provider === "gwdg" ? "GWDG" : "Claude";
 }
 
 function firstUserText(turns: Turn[]): string {
   return turns.find((t) => t.role === "user")?.text ?? "chat";
 }
 
-/** Parse the You/Claude turns back out of a transcript's markdown (for reloading a chat). */
+/** Parse the You/<assistant> turns back out of a transcript's markdown (for reloading a chat). */
 export function parseTranscriptTurns(content: string): Turn[] {
   const turns: Turn[] = [];
-  const heads = [...content.matchAll(/^##\s+(You|Claude)\s*$/gm)];
+  const heads = [...content.matchAll(/^##\s+(You|Claude|Codex|GWDG)\s*$/gm)];
   for (let i = 0; i < heads.length; i++) {
     const role = heads[i][1] === "You" ? "user" : "claude";
     const start = (heads[i].index ?? 0) + heads[i][0].length;

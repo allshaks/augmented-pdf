@@ -35,6 +35,8 @@ export interface AiRunOptions {
   messages?: AiMessage[];
   model?: string;
   effort?: string;
+  /** Let the model search the web this turn (Claude: via allowedTools; GWDG: its tool gateway). */
+  web?: boolean;
   // CLI-only knobs (ignored by HTTP providers):
   allowedTools?: string;
   permissionMode?: string;
@@ -43,7 +45,7 @@ export interface AiRunOptions {
 }
 
 export interface AiProvider {
-  readonly id: "claude" | "gwdg";
+  readonly id: "claude" | "gwdg" | "codex";
   readonly label: string;
   /**
    * What this backend can do — drives feature gating in the UI. `readsFiles` means it can pull a
