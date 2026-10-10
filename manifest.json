@@ -1,9 +1,9 @@
 {
   "id": "augmented-pdf",
   "name": "Augmented PDF (Claude)",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "minAppVersion": "1.6.5",
-  "description": "Ask Claude about a PDF highlight, a whole PDF, or any note; chats are saved as markdown with an accumulating summary, and passages link back to their chat. Builds on PDF++. Desktop only; requires the Claude CLI.",
+  "description": "Ask AI about a PDF highlight, a whole PDF, or any note; chats are saved as markdown with an accumulating summary, and passages link back to their chat. Runs on the Claude CLI, the Codex CLI, or GWDG Chat AI. Builds on PDF++. Desktop only.",
   "author": "",
   "isDesktopOnly": true
 }
